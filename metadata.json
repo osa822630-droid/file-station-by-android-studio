@@ -1,0 +1,6 @@
+{
+  "name": "File Station",
+  "description": "محطة شاملة لتنزيل وإدارة وتحويل ملفات الفيديو والصوت والمستندات بجميع الجودات والسرعات مع محرك بحث مدمج.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
