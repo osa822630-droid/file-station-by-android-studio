@@ -67,7 +67,7 @@ jobs:
 
   android-instrumented:
     name: Android Instrumented tests on API 36 emulator
-    runs-on: macos-15-intel
+    runs-on: ubuntu-24.04
     needs: jvm-lint-and-package
     timeout-minutes: 60
     steps:
@@ -90,6 +90,13 @@ jobs:
         run: |
           yes | sdkmanager --licenses
           sdkmanager "platforms;android-36.1" "build-tools;36.1.0" "platform-tools"
+
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm
 
       - name: Create temporary debug signing key
         run: |
@@ -114,6 +121,8 @@ jobs:
           cores: 2
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
           disable-animations: true
+          disable-linux-hw-accel: false
+          emulator-boot-timeout: 900
           script: ./gradlew :app:connectedDebugAndroidTest --no-daemon --max-workers=2
 
       - name: Upload Android Instrumented test reports
