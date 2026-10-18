@@ -1,0 +1,127 @@
+name: Android CI
+
+'on':
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jvm-lint-and-package:
+    name: JVM tests, lint, and Android test APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Install compile SDK packages and accept licenses
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-36.1" "build-tools;36.1.0" "platform-tools"
+
+      - name: Create temporary debug signing key
+        run: |
+          keytool -genkeypair -v \
+            -keystore debug.keystore \
+            -storepass android \
+            -keypass android \
+            -alias androiddebugkey \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Run JVM tests, lint, and build Android test APK
+        run: >-
+          ./gradlew :app:testDebugUnitTest :app:lintDebug
+          :app:compileDebugAndroidTestKotlin :app:assembleDebugAndroidTest
+          --no-daemon --max-workers=2
+
+      - name: Upload JVM and lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-and-lint-reports
+          if-no-files-found: warn
+          path: |
+            app/build/test-results/testDebugUnitTest/
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/reports/lint-results-debug.html
+
+  android-instrumented:
+    name: Android Instrumented tests on API 36 emulator
+    runs-on: macos-15-intel
+    needs: jvm-lint-and-package
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Install compile SDK packages and accept licenses
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-36.1" "build-tools;36.1.0" "platform-tools"
+
+      - name: Create temporary debug signing key
+        run: |
+          keytool -genkeypair -v \
+            -keystore debug.keystore \
+            -storepass android \
+            -keypass android \
+            -alias androiddebugkey \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Run Android Instrumented tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          system-image-api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7_pro
+          cores: 2
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          disable-animations: true
+          script: ./gradlew :app:connectedDebugAndroidTest --no-daemon --max-workers=2
+
+      - name: Upload Android Instrumented test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-instrumented-test-reports
+          if-no-files-found: warn
+          path: |
+            app/build/outputs/androidTest-results/connected/
+            app/build/reports/androidTests/connected/
