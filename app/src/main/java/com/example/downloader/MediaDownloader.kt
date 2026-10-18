@@ -3,7 +3,7 @@ package com.example.downloader
 import android.content.Context
 import android.media.MediaMetadataRetriever
 import com.example.audio.AudioTranscoder
-import com.example.audio.WavHelper
+import com.example.audio.VideoTranscoder
 import com.example.model.AudioBitrate
 import com.example.model.AudioFormat
 import com.example.model.DuplicateAction
@@ -27,6 +27,8 @@ class MediaDownloader(
     private val context: Context,
     private val audioTranscoder: AudioTranscoder
 ) {
+
+    private val videoTranscoder = VideoTranscoder(context)
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
@@ -318,9 +320,9 @@ class MediaDownloader(
                         PlaylistItem(
                             id = id,
                             title = "مقطع #${index + 1} من $playlistTitle",
-                            author = playlistTitle,
-                            durationText = "03:45",
-                            durationSeconds = 225,
+                            author = "",
+                            durationText = "--:--",
+                            durationSeconds = 0L,
                             thumbnailUrl = "https://img.youtube.com/vi/$id/hqdefault.jpg",
                             url = "https://www.youtube.com/watch?v=$id",
                             isSelected = true,
@@ -332,25 +334,6 @@ class MediaDownloader(
             }
         } catch (e: Exception) {
             e.printStackTrace()
-        }
-
-        if (items.isEmpty()) {
-            for (i in 1..4) {
-                items.add(
-                    PlaylistItem(
-                        id = "item_$i",
-                        title = "مقطع $i من $playlistTitle",
-                        author = playlistTitle,
-                        durationText = "03:20",
-                        durationSeconds = 200,
-                        thumbnailUrl = "",
-                        url = url,
-                        isSelected = true,
-                        isVideo = true,
-                        fileType = FileType.VIDEO
-                    )
-                )
-            }
         }
 
         return ExtractedMediaInfo(
@@ -366,7 +349,15 @@ class MediaDownloader(
     fun checkFileExists(targetFileName: String): File? {
         val downloadsDir = File(context.filesDir, "audio_downloads")
         val file = File(downloadsDir, targetFileName)
-        return if (file.exists() && file.length() > 0) file else null
+        return file.takeIf { it.isFile }
+    }
+
+    fun existingOutputFileNames(): Set<String> {
+        val downloadsDir = File(context.filesDir, "audio_downloads")
+        return downloadsDir.listFiles()
+            ?.filter { it.isFile }
+            ?.mapTo(mutableSetOf()) { it.name }
+            ?: emptySet()
     }
 
     /**
@@ -382,6 +373,18 @@ class MediaDownloader(
         return file
     }
 
+    private fun publishStagedOutput(stagedFile: File, destination: File): Boolean {
+        if (!stagedFile.isFile || stagedFile.length() <= 0L) return false
+        return try {
+            // Same-directory POSIX rename atomically replaces destination on Android/Linux.
+            android.system.Os.rename(stagedFile.absolutePath, destination.absolutePath)
+            destination.isFile && destination.length() > 0L
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
+    }
+
     /**
      * Downloads any media/file from any link, applies speed/format processing,
      * and handles duplicate conflicts.
@@ -389,10 +392,11 @@ class MediaDownloader(
     suspend fun downloadAndProcessItem(
         item: PlaylistItem,
         targetFormat: AudioFormat,
-        targetQuality: VideoQuality,
         targetSpeed: Float,
+        targetQuality: VideoQuality = VideoQuality.Q720P,
         targetBitrate: AudioBitrate = AudioBitrate.B128,
         duplicateAction: DuplicateAction = DuplicateAction.DOWNLOAD_ANYWAY,
+        outputFileName: String? = null,
         onDownloadProgress: (progress: Float, downloaded: Long, total: Long) -> Unit,
         onSpeedProgress: (progress: Float, stage: String) -> Unit
     ): MediaItem? = withContext(Dispatchers.IO) {
@@ -402,20 +406,40 @@ class MediaDownloader(
 
         val downloadsDir = File(context.filesDir, "audio_downloads").apply { mkdirs() }
         val cleanTitle = item.title.replace(Regex("[^a-zA-Z0-9أ-ي_\\-\\s]"), "").trim().ifEmpty { "ملف_${System.currentTimeMillis()}" }
-        val speedTag = if (targetSpeed != 1.0f) "_${targetSpeed}x" else ""
 
-        // Decide output extension
-        val isVideoDownload = item.isVideo && (targetFormat == AudioFormat.MP4 || targetFormat == AudioFormat.MKV || targetFormat == AudioFormat.WEBM)
-        val outputExt = if (isVideoDownload) targetFormat.extension else targetFormat.extension
-        val baseFileName = "$cleanTitle$speedTag"
-
-        val targetOutputFile = if (duplicateAction == DuplicateAction.REPLACE_EXISTING) {
-            val existing = File(downloadsDir, "$baseFileName.$outputExt")
-            if (existing.exists()) existing.delete()
-            existing
+        // Video containers cannot be produced by the audio-copy path. Refuse an audio
+        // source selected for a video extension rather than relabeling its bytes.
+        val requestsVideoContainer = targetFormat == AudioFormat.MP4 ||
+            targetFormat == AudioFormat.MKV || targetFormat == AudioFormat.WEBM
+        if (requestsVideoContainer && !item.isVideo) return@withContext null
+        val isVideoDownload = item.isVideo && requestsVideoContainer
+        val speedTag = if (kotlin.math.abs(targetSpeed - 1.0f) > 0.01f) "_${targetSpeed}x" else ""
+        val qualityTag = if (isVideoDownload) "_${targetQuality.height}p" else ""
+        val outputExt = targetFormat.extension
+        val baseFileName = "$cleanTitle$qualityTag$speedTag"
+        val plannedFileName = outputFileName?.let { name ->
+            name.takeIf { File(it).name == it && it.endsWith(".$outputExt", ignoreCase = true) }
+        }
+        if (outputFileName != null && plannedFileName == null) return@withContext null
+        val requestedOutputFile = if (plannedFileName != null) {
+            val plannedFile = File(downloadsDir, plannedFileName)
+            if (duplicateAction == DuplicateAction.DOWNLOAD_ANYWAY && plannedFile.exists()) {
+                getUniqueFileName(
+                    downloadsDir,
+                    plannedFile.nameWithoutExtension,
+                    outputExt
+                )
+            } else plannedFile
+        } else if (duplicateAction == DuplicateAction.REPLACE_EXISTING) {
+            File(downloadsDir, "$baseFileName.$outputExt")
         } else {
             getUniqueFileName(downloadsDir, baseFileName, outputExt)
         }
+        // Keep an existing file intact throughout download and conversion. The staged file
+        // retains the real extension so the appropriate muxer/encoder still selects correctly.
+        val targetOutputFile = if (duplicateAction == DuplicateAction.REPLACE_EXISTING) {
+            File(downloadsDir, ".${requestedOutputFile.nameWithoutExtension}.${UUID.randomUUID()}.pending.$outputExt")
+        } else requestedOutputFile
 
         val tempDownloadFile = File(downloadsDir, "temp_download_${UUID.randomUUID()}.tmp")
 
@@ -433,8 +457,11 @@ class MediaDownloader(
             }
 
             var downloadSuccessful = false
-            var finalDurationMs = item.durationSeconds * 1000L
-            var finalResolution = if (isVideoDownload) targetQuality.label else ""
+            var originalDurationMs = item.durationSeconds * 1000L
+            var finalDurationMs = originalDurationMs
+            var finalResolution = ""
+            var sourceBitrateKbps: Int? = null
+            var finalVideoInfo: VideoTranscoder.VideoInfo? = null
 
             // Attempt real streaming download
             if (streamUrl.isNotEmpty() && !isYouTubeVideoUrl(streamUrl)) {
@@ -443,28 +470,27 @@ class MediaDownloader(
                         .url(streamUrl)
                         .header("User-Agent", userAgent)
                         .build()
-                    val resp = httpClient.newCall(req).execute()
-                    val body = resp.body
-                    if (resp.isSuccessful && body != null) {
-                        val totalBytes = body.contentLength()
-                        var bytesCopied = 0L
+                    httpClient.newCall(req).execute().use { resp ->
+                        val body = resp.body
+                        if (resp.isSuccessful && body != null) {
+                            val totalBytes = body.contentLength()
+                            var bytesCopied = 0L
 
-                        body.byteStream().use { input ->
-                            FileOutputStream(tempDownloadFile).use { output ->
-                                val buffer = ByteArray(16384)
-                                var read: Int
-                                while (input.read(buffer).also { read = it } != -1) {
-                                    output.write(buffer, 0, read)
-                                    bytesCopied += read
-                                    if (totalBytes > 0) {
-                                        onDownloadProgress(bytesCopied.toFloat() / totalBytes, bytesCopied, totalBytes)
+                            body.byteStream().use { input ->
+                                FileOutputStream(tempDownloadFile).use { output ->
+                                    val buffer = ByteArray(16384)
+                                    var read: Int
+                                    while (input.read(buffer).also { read = it } != -1) {
+                                        output.write(buffer, 0, read)
+                                        bytesCopied += read
+                                        if (totalBytes > 0) {
+                                            onDownloadProgress(bytesCopied.toFloat() / totalBytes, bytesCopied, totalBytes)
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        if (tempDownloadFile.exists() && tempDownloadFile.length() > 512) {
-                            downloadSuccessful = true
+                            downloadSuccessful = tempDownloadFile.exists() && tempDownloadFile.length() > 0L
                         }
                     }
                 } catch (e: Exception) {
@@ -472,14 +498,10 @@ class MediaDownloader(
                 }
             }
 
-            // Fallback: If streaming URL was blocked by platform CDN, provide clean audio or real media stream
+            // Never substitute generated content for a failed download.
             if (!downloadSuccessful) {
-                // Ensure user NEVER hears a whistle!
-                // Download a clean media file or generate a silent/speech natural voice audio
-                onDownloadProgress(0.4f, 500000, 1000000)
-                writeNaturalSpeechAudio(tempDownloadFile, durationSeconds = item.durationSeconds.coerceIn(10L, 60L).toInt())
-                onDownloadProgress(1.0f, 1000000, 1000000)
-                downloadSuccessful = true
+                tempDownloadFile.delete()
+                return@withContext null
             }
 
             // Inspect downloaded file metadata (real duration, resolution)
@@ -489,18 +511,82 @@ class MediaDownloader(
                 val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 val parsedDur = durStr?.toLongOrNull() ?: 0L
                 if (parsedDur > 0) {
+                    originalDurationMs = parsedDur
                     finalDurationMs = parsedDur
                 }
                 val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
                 val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
-                if (width != null && height != null) {
-                    finalResolution = "${height}p ($width x $height)"
+                val parsedWidth = width?.toIntOrNull()
+                val parsedHeight = height?.toIntOrNull()
+                if (isVideoDownload && parsedWidth != null && parsedHeight != null) {
+                    finalResolution = "${minOf(parsedWidth, parsedHeight)}p (${parsedWidth} x ${parsedHeight})"
                 }
+                sourceBitrateKbps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
+                    ?.toIntOrNull()?.takeIf { it > 0 }?.div(1000)
                 retriever.release()
             } catch (_: Exception) {}
 
-            // 2. Format & Speed Transcoding if needed
-            if (!isVideoDownload && (kotlin.math.abs(targetSpeed - 1.0f) > 0.01f || targetFormat == AudioFormat.MP3 || targetFormat == AudioFormat.M4A || targetFormat == AudioFormat.WAV)) {
+            if (isVideoDownload) {
+                val videoInfo = videoTranscoder.inspectVideo(tempDownloadFile)
+                if (videoInfo == null) {
+                    onSpeedProgress(0.1f, "تعذر التحقق من مسار الفيديو؛ أُلغي إخراج الملف.")
+                    tempDownloadFile.delete()
+                    return@withContext null
+                }
+                finalResolution = "${minOf(videoInfo.width, videoInfo.height)}p (${videoInfo.width} x ${videoInfo.height})"
+                if (sourceBitrateKbps == null && videoInfo.bitRate > 0) {
+                    sourceBitrateKbps = videoInfo.bitRate / 1000
+                }
+            }
+
+            // 2. Re-encode video through Android's decoder/encoder for the requested size and speed.
+            var audioOutputInfo: AudioTranscoder.AudioOutputInfo? = null
+            if (isVideoDownload) {
+                if (targetFormat == AudioFormat.WEBM) {
+                    val sourceInfo = videoTranscoder.inspectVideo(tempDownloadFile)
+                    val requestedShortSide = sourceInfo?.let { minOf(it.width, it.height, targetQuality.height) } ?: 0
+                    if (sourceInfo == null || sourceInfo.width <= 0 || sourceInfo.height <= 0 ||
+                        kotlin.math.abs(targetSpeed - 1.0f) > 0.01f ||
+                        minOf(sourceInfo.width, sourceInfo.height) > targetQuality.height) {
+                        onSpeedProgress(0.1f, "إعادة الترميز إلى WebM غير مدعومة؛ يتطلب WebM الحالي نسخ مسار المصدر دون تغيير الدقة أو السرعة.")
+                        tempDownloadFile.delete()
+                        return@withContext null
+                    }
+                    onSpeedProgress(0.1f, "إعادة تعبئة مسار المصدر في حاوية WebM دون تغيير الدقة أو السرعة (حد الدقة ${requestedShortSide}px)...")
+                    val remuxSuccess = videoTranscoder.remuxVideo(
+                        sourceFile = tempDownloadFile,
+                        outputFile = targetOutputFile,
+                        onProgress = onSpeedProgress
+                    )
+                    tempDownloadFile.delete()
+                    if (!remuxSuccess || !targetOutputFile.isFile || targetOutputFile.length() <= 0L) {
+                        targetOutputFile.delete()
+                        return@withContext null
+                    }
+                    finalVideoInfo = videoTranscoder.inspectVideo(targetOutputFile)
+                    finalVideoInfo?.let { info ->
+                        if (info.durationUs > 0) finalDurationMs = info.durationUs / 1000L
+                        finalResolution = "${minOf(info.width, info.height)}p (${info.width} x ${info.height})"
+                    }
+                } else {
+                    onSpeedProgress(0.1f, "إعادة ترميز الفيديو إلى حد أقصى ${targetQuality.height}p وبسرعة ${targetSpeed}x داخل ${targetFormat.extension.uppercase()}...")
+                    finalVideoInfo = videoTranscoder.transcodeVideo(
+                        sourceFile = tempDownloadFile,
+                        outputFile = targetOutputFile,
+                        targetQuality = targetQuality,
+                        targetSpeed = targetSpeed,
+                        onProgress = onSpeedProgress
+                    )
+                    tempDownloadFile.delete()
+                    if (finalVideoInfo == null || !targetOutputFile.isFile || targetOutputFile.length() <= 0L) {
+                        targetOutputFile.delete()
+                        return@withContext null
+                    }
+                    finalDurationMs = finalVideoInfo!!.durationUs / 1000L
+                    finalResolution = "${minOf(finalVideoInfo!!.width, finalVideoInfo!!.height)}p (${finalVideoInfo!!.width} x ${finalVideoInfo!!.height})"
+                    sourceBitrateKbps = finalVideoInfo!!.bitRate.takeIf { it > 0 }?.div(1000) ?: sourceBitrateKbps
+                }
+            } else if (kotlin.math.abs(targetSpeed - 1.0f) > 0.01f || targetFormat == AudioFormat.MP3 || targetFormat == AudioFormat.M4A || targetFormat == AudioFormat.WAV) {
                 onSpeedProgress(0.1f, "تطبيق سرعة ${targetSpeed}x وترميز ${targetFormat.name}...")
                 val transcodeSuccess = audioTranscoder.transcodeAudio(
                     sourceUri = null,
@@ -509,41 +595,61 @@ class MediaDownloader(
                     targetSpeed = targetSpeed,
                     targetFormat = targetFormat,
                     bitrateKbps = targetBitrate.kbps,
-                    onProgress = onSpeedProgress
+                    onProgress = onSpeedProgress,
+                    onOutputInfo = { audioOutputInfo = it }
                 )
                 tempDownloadFile.delete()
 
-                if (!transcodeSuccess || !targetOutputFile.exists()) {
+                if (!transcodeSuccess || !targetOutputFile.isFile || targetOutputFile.length() <= 0L) {
+                    targetOutputFile.delete()
                     return@withContext null
                 }
             } else {
-                // Direct file rename/move
-                tempDownloadFile.renameTo(targetOutputFile)
+                // A failed move must not be reported as a successful library item.
+                val moved = tempDownloadFile.renameTo(targetOutputFile)
+                if (!moved || !targetOutputFile.isFile || targetOutputFile.length() <= 0L) {
+                    tempDownloadFile.delete()
+                    targetOutputFile.delete()
+                    return@withContext null
+                }
             }
 
-            val finalFileLength = targetOutputFile.length()
-            val effectiveDurationMs = if (targetSpeed > 0 && finalDurationMs > 0) {
+            if (targetOutputFile != requestedOutputFile &&
+                !publishStagedOutput(targetOutputFile, requestedOutputFile)) {
+                targetOutputFile.delete()
+                return@withContext null
+            }
+            val finalFileLength = requestedOutputFile.length()
+            if (finalFileLength <= 0L) return@withContext null
+            val effectiveDurationMs = if (isVideoDownload) finalDurationMs else if (targetSpeed > 0 && finalDurationMs > 0) {
                 (finalDurationMs / targetSpeed).toLong()
             } else finalDurationMs
 
             return@withContext MediaItem(
                 id = UUID.randomUUID().toString(),
-                title = targetOutputFile.nameWithoutExtension,
-                filePath = targetOutputFile.absolutePath,
+                title = requestedOutputFile.nameWithoutExtension,
+                filePath = requestedOutputFile.absolutePath,
                 durationMs = effectiveDurationMs,
-                originalDurationMs = finalDurationMs,
+                originalDurationMs = originalDurationMs,
                 speed = targetSpeed,
                 format = targetFormat.name,
                 fileSize = finalFileLength,
                 isVideo = isVideoDownload,
-                fileType = if (isVideoDownload) FileType.VIDEO else item.fileType,
+                fileType = when {
+                    isVideoDownload -> FileType.VIDEO
+                    targetFormat == AudioFormat.MP3 || targetFormat == AudioFormat.M4A ||
+                        targetFormat == AudioFormat.WAV -> FileType.AUDIO
+                    else -> item.fileType
+                },
                 resolutionText = finalResolution,
-                bitrateKbps = targetBitrate.kbps,
+                bitrateKbps = audioOutputInfo?.appliedBitrateKbps
+                    ?: if (isVideoDownload) finalVideoInfo?.bitRate?.takeIf { it > 0 }?.div(1000) ?: sourceBitrateKbps ?: 0 else targetBitrate.kbps,
                 sourceUrl = item.url
             )
         } catch (e: Exception) {
             e.printStackTrace()
             if (tempDownloadFile.exists()) tempDownloadFile.delete()
+            targetOutputFile.delete()
             return@withContext null
         }
     }
@@ -575,38 +681,6 @@ class MediaDownloader(
             } catch (_: Exception) {}
         }
         return ""
-    }
-
-    /**
-     * Generates a smooth, natural spoken audio waveform (NOT a whistling sine wave)
-     */
-    private fun writeNaturalSpeechAudio(outputFile: File, durationSeconds: Int) {
-        val sampleRate = 44100
-        val totalSamples = sampleRate * durationSeconds
-        val pcm = ShortArray(totalSamples)
-
-        // Generate warm speech-like formant harmonics (fundamentals 120-180Hz with soft natural decay)
-        for (i in 0 until totalSamples) {
-            val t = i.toDouble() / sampleRate
-            val speechModulation = kotlin.math.sin(2.0 * Math.PI * 2.5 * t) // Sentence cadences
-            if (speechModulation > -0.2) {
-                val voiceF0 = 140.0 + 15.0 * kotlin.math.sin(2.0 * Math.PI * 0.8 * t)
-                val h1 = 0.5 * kotlin.math.sin(2.0 * Math.PI * voiceF0 * t)
-                val h2 = 0.25 * kotlin.math.sin(2.0 * Math.PI * (voiceF0 * 2.0) * t)
-                val h3 = 0.12 * kotlin.math.sin(2.0 * Math.PI * (voiceF0 * 3.0) * t)
-                val sampleVal = ((h1 + h2 + h3) * 0.35 * 32767.0).toInt().coerceIn(-32768, 32767)
-                pcm[i] = sampleVal.toShort()
-            } else {
-                pcm[i] = 0 // Natural pauses between words
-            }
-        }
-
-        WavHelper.writeWavFile(
-            outputFile = outputFile,
-            pcmData = pcm,
-            sampleRate = sampleRate,
-            channels = 1
-        )
     }
 
     private fun formatSecondsToTime(seconds: Long): String {

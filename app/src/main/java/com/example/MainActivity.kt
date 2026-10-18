@@ -65,6 +65,9 @@ class MainActivity : ComponentActivity() {
                 duplicateConflict?.let { conflict ->
                     DuplicateFileDialog(
                         fileName = conflict.fileName,
+                        itemTitle = conflict.itemTitle,
+                        conflictIndex = conflict.conflictIndex,
+                        conflictCount = conflict.conflictCount,
                         onChoice = { action ->
                             viewModel.resolveDuplicateConflict(action)
                         },

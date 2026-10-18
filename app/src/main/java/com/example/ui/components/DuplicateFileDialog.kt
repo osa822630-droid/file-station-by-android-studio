@@ -18,7 +18,10 @@ import com.example.model.DuplicateAction
 fun DuplicateFileDialog(
     fileName: String,
     onChoice: (DuplicateAction) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    itemTitle: String? = null,
+    conflictIndex: Int? = null,
+    conflictCount: Int? = null
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -40,6 +43,20 @@ fun DuplicateFileDialog(
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (!itemTitle.isNullOrBlank()) {
+                    Text(
+                        text = "العنصر: $itemTitle",
+                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+                if (conflictIndex != null && conflictCount != null && conflictCount > 1) {
+                    Text(
+                        text = "تعارض $conflictIndex من $conflictCount",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 Text(
                     text = "يوجد ملف بنفس الاسم محفوظ في محطة الملفات:",
                     style = MaterialTheme.typography.bodyMedium

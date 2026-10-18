@@ -103,6 +103,95 @@ class ExampleRobolectricTest {
     }
 
     @Test
+    fun `jump3r LAME core encodes PCM as MPEG Layer III`() {
+        val pcm = ShortArray(44100) { index ->
+            (kotlin.math.sin(2.0 * Math.PI * 440.0 * index / 44100) * 12000).toInt().toShort()
+        }
+        val encoder = com.example.audio.Mp3PcmEncoder(44100, 1, 128)
+        val encoded = ByteArray(4096 + 4096 / 4 + 7200)
+        val output = java.io.ByteArrayOutputStream()
+        try {
+            var frameOffset = 0
+            while (frameOffset < pcm.size) {
+                val frameCount = minOf(4096, pcm.size - frameOffset)
+                val bytes = encoder.encodeInterleaved(pcm, frameOffset, frameCount, encoded)
+                assertTrue("LAME returned an encoding error: $bytes", bytes >= 0)
+                if (bytes > 0) output.write(encoded, 0, bytes)
+                frameOffset += frameCount
+            }
+            val flushed = encoder.flush(encoded)
+            assertTrue("LAME returned a flush error: $flushed", flushed >= 0)
+            if (flushed > 0) output.write(encoded, 0, flushed)
+        } finally {
+            encoder.close()
+        }
+        assertTrue("LAME must produce bytes", output.size() > 64)
+        assertTrue("LAME output must contain an MPEG Layer III frame", containsMp3Frame(output.toByteArray()))
+    }
+
+    @Test
+    fun `audio transcoder writes real MP3 frames and refuses mismatched extensions`() {
+        kotlinx.coroutines.runBlocking {
+            val context = ApplicationProvider.getApplicationContext<Context>()
+            val transcoder = com.example.audio.AudioTranscoder(context)
+            val testInput = File(context.cacheDir, "mp3_source_${System.nanoTime()}.wav")
+            val mp3Output = File(context.cacheDir, "encoded_${System.nanoTime()}.mp3")
+            val wrongExtensionOutput = File(context.cacheDir, "wrong_extension_${System.nanoTime()}.wav")
+            val pcm = ShortArray(44100) { index ->
+                (kotlin.math.sin(2.0 * Math.PI * 440.0 * index / 44100) * 12000).toInt().toShort()
+            }
+            WavHelper.writeWavFile(testInput, pcm, 44100, 1)
+
+            val stages = mutableListOf<String>()
+            val mp3Success = transcoder.transcodeAudio(
+                sourceUri = null,
+                sourceFile = testInput,
+                outputFile = mp3Output,
+                targetSpeed = 1.0f,
+                targetFormat = com.example.model.AudioFormat.MP3,
+                bitrateKbps = 128
+            ) { _, stage -> stages += stage }
+            val mismatchedSuccess = transcoder.transcodeAudio(
+                sourceUri = null,
+                sourceFile = testInput,
+                outputFile = wrongExtensionOutput,
+                targetSpeed = 1.0f,
+                targetFormat = com.example.model.AudioFormat.M4A
+            ) { _, _ -> }
+
+            assertTrue("LAME must create a nonempty MP3 file; stages=$stages; exists=${mp3Output.exists()}; size=${mp3Output.length()}", mp3Success && mp3Output.length() > 128L)
+            assertTrue("Output must contain a valid MPEG Layer III frame header", containsMp3Frame(mp3Output.readBytes()))
+            assertTrue("M4A output must use the matching file extension", !mismatchedSuccess)
+            assertTrue(!wrongExtensionOutput.exists())
+            testInput.delete()
+            mp3Output.delete()
+        }
+    }
+
+    private fun containsMp3Frame(data: ByteArray): Boolean {
+        val start = if (data.size >= 10 && data[0] == 'I'.code.toByte() &&
+            data[1] == 'D'.code.toByte() && data[2] == '3'.code.toByte()) {
+            val tagSize = ((data[6].toInt() and 0x7f) shl 21) or
+                ((data[7].toInt() and 0x7f) shl 14) or
+                ((data[8].toInt() and 0x7f) shl 7) or
+                (data[9].toInt() and 0x7f)
+            10 + tagSize
+        } else 0
+        for (index in start until data.size - 3) {
+            val first = data[index].toInt() and 0xff
+            val second = data[index + 1].toInt() and 0xff
+            val third = data[index + 2].toInt() and 0xff
+            val version = (second shr 3) and 0x03
+            val layer = (second shr 1) and 0x03
+            val bitrateIndex = (third shr 4) and 0x0f
+            val sampleRateIndex = (third shr 2) and 0x03
+            if (first == 0xff && (second and 0xe0) == 0xe0 && version != 1 && layer == 1 &&
+                bitrateIndex in 1..14 && sampleRateIndex != 3) return true
+        }
+        return false
+    }
+
+    @Test
     fun `test audio transcoder wav format transcoding`() {
         kotlinx.coroutines.runBlocking {
             val context = ApplicationProvider.getApplicationContext<Context>()

@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -46,9 +47,9 @@ fun SpeedConverterScreen(
     val selectedUri by viewModel.selectedLocalUri.collectAsState()
     val metadata by viewModel.selectedLocalMetadata.collectAsState()
     val targetSpeed by viewModel.targetLocalSpeed.collectAsState()
+    val targetQuality by viewModel.targetLocalQuality.collectAsState()
     val targetFormat by viewModel.targetLocalFormat.collectAsState()
     val targetBitrate by viewModel.targetLocalBitrate.collectAsState()
-    val targetQuality by viewModel.targetLocalQuality.collectAsState()
     val conversionState by viewModel.conversionState.collectAsState()
 
     var showGuideDialog by remember { mutableStateOf(false) }
@@ -105,13 +106,13 @@ fun SpeedConverterScreen(
 
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "محول جودات الفيديو والصوت والسرعات",
+                        text = "تحويل الصوت وإعادة ترميز الفيديو",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onPrimaryContainer
                     )
                     Text(
-                        text = "تقليل جودة الفيديو (من الأعلى للأقل 1080p -> 720p/480p) أو تحويل واستخراج الصوت وتسريع التشغيل.",
+                        text = "تغيّر الدقة والسرعة بإعادة ترميز فعلية؛ يمكن أيضًا تحويل الصوت واستخراجه بصيغ متعددة.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
                     )
@@ -132,7 +133,7 @@ fun SpeedConverterScreen(
             Column(modifier = Modifier.padding(16.dp)) {
                 SectionHeader(
                     title = "اختيار ملف الفيديو أو الصوت من جهازك",
-                    subtitle = "اختر أي فيديو أو صوتية لتغيير الدقة أو استخراج الصوت أو تغيير السرعة",
+                    subtitle = "اختر فيديو لتغيير دقته وسرعته فعليًا أو صوتًا لتحويل صيغته وسرعته",
                     icon = Icons.Default.FolderOpen
                 )
 
@@ -200,8 +201,10 @@ fun SpeedConverterScreen(
             }
         }
 
-        // Quality Downscaling & Format Choice
+        // Video outputs pass through Media3's real decode, scale, speed and encode pipeline.
         val isVideoSource = metadata?.isVideo == true
+        val isVideoTarget = targetFormat == AudioFormat.MP4 || targetFormat == AudioFormat.MKV || targetFormat == AudioFormat.WEBM
+        val isVideoTransform = isVideoSource && isVideoTarget
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp),
@@ -210,7 +213,11 @@ fun SpeedConverterScreen(
             Column(modifier = Modifier.padding(16.dp)) {
                 SectionHeader(
                     title = "إعدادات تحويل الجودة والصيغة",
-                    subtitle = if (isVideoSource) "اختر تقليل دقة الفيديو أو استخراج الصوت منه" else "اختر صيغة ومعدل جودة الصوت",
+                    subtitle = when {
+                        isVideoTransform -> "إعادة ترميز الفيديو فعليًا بالدقة والسرعة المختارتين"
+                        isVideoSource -> "اختر صيغة الصوت المستخرج وسرعته"
+                        else -> "اختر صيغة ومعدل جودة الصوت"
+                    },
                     icon = Icons.Default.AutoFixHigh
                 )
 
@@ -225,7 +232,7 @@ fun SpeedConverterScreen(
                 Spacer(modifier = Modifier.height(6.dp))
 
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     val availableFormats = if (isVideoSource) {
@@ -233,12 +240,13 @@ fun SpeedConverterScreen(
                             AudioFormat.MP4 to "فيديو MP4",
                             AudioFormat.MKV to "فيديو MKV",
                             AudioFormat.MP3 to "استخراج MP3",
+                            AudioFormat.M4A to "استخراج M4A (AAC)",
                             AudioFormat.WAV to "صوت WAV"
                         )
                     } else {
                         listOf(
                             AudioFormat.MP3 to "صوت MP3",
-                            AudioFormat.M4A to "صوت M4A",
+                            AudioFormat.M4A to "صوت M4A (AAC)",
                             AudioFormat.WAV to "صوت WAV"
                         )
                     }
@@ -257,36 +265,35 @@ fun SpeedConverterScreen(
                     }
                 }
 
-                // Video Downscale Options (1080p -> 720p, 480p, 360p, 240p)
-                val isVideoTarget = targetFormat == AudioFormat.MP4 || targetFormat == AudioFormat.MKV || targetFormat == AudioFormat.WEBM
-                if (isVideoSource && isVideoTarget) {
+                // Actual video scale presets; treated as a maximum short edge and never upscaled.
+                if (isVideoTransform) {
                     Spacer(modifier = Modifier.height(14.dp))
-                    Text(
-                        text = "تقليل دقة وجودة الفيديو (Downscaling):",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "تحويل من الدقة العالية إلى دقة أقل لتوفير المساحة وتسهيل المشاركة",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "حد دقة الفيديو:",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "${targetQuality.height}p كحد أقصى",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                     Spacer(modifier = Modifier.height(6.dp))
 
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        listOf(
-                            VideoQuality.Q720P,
-                            VideoQuality.Q480P,
-                            VideoQuality.Q360P,
-                            VideoQuality.Q240P
-                        ).forEach { q ->
-                            val isSelected = targetQuality == q
+                        VideoQuality.values().forEach { q ->
                             FilterChip(
-                                selected = isSelected,
+                                selected = targetQuality == q,
                                 onClick = { viewModel.setTargetLocalQuality(q) },
                                 label = { Text(q.label.substringBefore(" ")) },
                                 colors = FilterChipDefaults.filterChipColors(
@@ -296,6 +303,19 @@ fun SpeedConverterScreen(
                             )
                         }
                     }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "يحافظ التحويل على تناسب أبعاد الفيديو؛ لا تُرفع دقة المصدر الأصغر من الاختيار.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else if (targetFormat == AudioFormat.WAV) {
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Text(
+                        text = "WAV يحفظ الصوت PCM غير المضغوط؛ معدل البت تحدده العينة والقنوات ولا ينطبق عليه اختيار ضغط MP3/AAC.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 } else {
                     // Audio Bitrates
                     Spacer(modifier = Modifier.height(14.dp))
@@ -347,7 +367,7 @@ fun SpeedConverterScreen(
             Column(modifier = Modifier.padding(16.dp)) {
                 SectionHeader(
                     title = "تحديد سرعة التشغيل",
-                    subtitle = "تسريع أو تبطيء الصوت مع الحفاظ على النبرة الطبيعية",
+                    subtitle = if (isVideoTransform) "تغيير سرعة الفيديو والصوت متزامنًا مع الحفاظ على النبرة الطبيعية" else "تسريع أو تبطيء الصوت مع الحفاظ على النبرة الطبيعية",
                     icon = Icons.Default.Speed
                 )
 
@@ -368,7 +388,7 @@ fun SpeedConverterScreen(
 
                 // Speed Preset Buttons
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f).forEach { s ->
@@ -376,6 +396,7 @@ fun SpeedConverterScreen(
                         FilterChip(
                             selected = isSelected,
                             onClick = { viewModel.setTargetLocalSpeed(s) },
+                            enabled = true,
                             label = { Text("${s}x") },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = MaterialTheme.colorScheme.primary,

@@ -76,15 +76,15 @@ fun FileStationGuideDialog(
                 StationGuideCard(
                     icon = Icons.Default.CloudDownload,
                     iconTint = MaterialTheme.colorScheme.primary,
-                    title = "تحميل الفيديوهات بجميع الجودات والسرعات",
-                    description = "يدعم التطبيق تنزيل الفيديوهات بدقة 1080p Full HD و 720p HD و 480p و 360p و 240p مع إمكانية تعديل سرعة التشغيل (0.5x وحتى 2.0x) بصوت واضح ونبرة نقية تماماً."
+                    title = "تنزيل الفيديو وتغيير الدقة والسرعة",
+                    description = "يعيد التطبيق فك ترميز الفيديو وترميزه عبر Media3 ومشفرات Android لتطبيق حد الدقة المختار وسرعة 0.5x–2x مع تزامن الصوت والصورة. إخراج MP4 متاح على الأجهزة الداعمة؛ وMKV يعيد تعبئة المسارات المرمزة ويتطلب Android 8.0 أو أحدث. لا تُرفع دقة المصادر الأصغر من الهدف."
                 )
 
                 StationGuideCard(
                     icon = Icons.Default.Transform,
                     iconTint = MaterialTheme.colorScheme.primary,
-                    title = "تحويل وتقليل جودات وصيغ الفيديو",
-                    description = "يمكنك اختيار أي فيديو من جهازك وتقليل جودته من الأعلى للأقل لتقليص الحجم وتوفير الذاكرة، أو تحويل الفيديو إلى ملف صوتي عالي النقاء MP3 / M4A / WAV."
+                    title = "استخراج الصوت من الفيديو",
+                    description = "يمكنك استخراج الصوت من الفيديو أو تحويل الملفات الصوتية إلى MP3 بترميز LAME، أو AAC داخل M4A، أو WAV غير مضغوط."
                 )
 
                 StationGuideCard(

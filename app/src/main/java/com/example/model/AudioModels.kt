@@ -11,7 +11,7 @@ enum class FileType(val label: String) {
 }
 
 enum class AudioFormat(val extension: String, val mimeType: String, val label: String) {
-    MP3("mp3", "audio/mpeg", "MP3 - متوافق مع كافة المشغلات"),
+    MP3("mp3", "audio/mpeg", "MP3 - ترميز LAME حقيقي"),
     M4A("m4a", "audio/mp4", "M4A (AAC) - حجم صغير وجودة عالية"),
     WAV("wav", "audio/wav", "WAV - صوت خام عالي النقاء"),
     MP4("mp4", "video/mp4", "MP4 - فيديو كامل عالي الجودة"),
@@ -102,6 +102,9 @@ sealed class DownloadState {
         val progress: Float,
         val speed: Float
     ) : DownloadState()
-    data class Completed(val downloadedItems: List<MediaItem>) : DownloadState()
+    data class Completed(
+        val downloadedItems: List<MediaItem>,
+        val failedCount: Int = 0
+    ) : DownloadState()
     data class Error(val message: String) : DownloadState()
 }

@@ -8,6 +8,8 @@ import com.example.audio.AudioPlayerController
 import com.example.audio.AudioTranscoder
 import com.example.audio.VideoTranscoder
 import com.example.data.MediaItemRepository
+import com.example.downloader.DownloadFilePlan
+import com.example.downloader.DownloadFilePlanner
 import com.example.downloader.MediaDownloader
 import com.example.model.AudioBitrate
 import com.example.model.AudioFormat
@@ -39,7 +41,16 @@ import java.util.regex.Pattern
 
 data class DuplicateConflict(
     val fileName: String,
+    val itemTitle: String,
+    val conflictIndex: Int,
+    val conflictCount: Int,
     val pendingAction: (DuplicateAction) -> Unit
+)
+
+private data class PlannedDownloadRequest(
+    val item: PlaylistItem,
+    val filePlan: DownloadFilePlan,
+    val duplicateAction: DuplicateAction = DuplicateAction.DOWNLOAD_ANYWAY
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -67,14 +78,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _downloadState = MutableStateFlow<DownloadState>(DownloadState.Idle)
     val downloadState = _downloadState.asStateFlow()
 
-    private val _targetDownloadFormat = MutableStateFlow(AudioFormat.MP4) // Default MP4 video or MP3
+    private val _targetDownloadFormat = MutableStateFlow(AudioFormat.MP4) // Default video format
     val targetDownloadFormat = _targetDownloadFormat.asStateFlow()
+
+    private val _targetDownloadSpeed = MutableStateFlow(1.0f)
+    val targetDownloadSpeed = _targetDownloadSpeed.asStateFlow()
 
     private val _targetDownloadQuality = MutableStateFlow(VideoQuality.Q720P)
     val targetDownloadQuality = _targetDownloadQuality.asStateFlow()
-
-    private val _targetDownloadSpeed = MutableStateFlow(1.0f) // Speed options: 0.5x, 0.75x, 1x, 1.25x, 1.5x, 1.75x, 2x
-    val targetDownloadSpeed = _targetDownloadSpeed.asStateFlow()
 
     private val _targetDownloadBitrate = MutableStateFlow(AudioBitrate.B128)
     val targetDownloadBitrate = _targetDownloadBitrate.asStateFlow()
@@ -93,14 +104,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _targetLocalSpeed = MutableStateFlow(1.0f)
     val targetLocalSpeed = _targetLocalSpeed.asStateFlow()
 
+    private val _targetLocalQuality = MutableStateFlow(VideoQuality.Q720P)
+    val targetLocalQuality = _targetLocalQuality.asStateFlow()
+
     private val _targetLocalFormat = MutableStateFlow(AudioFormat.MP3)
     val targetLocalFormat = _targetLocalFormat.asStateFlow()
 
     private val _targetLocalBitrate = MutableStateFlow(AudioBitrate.B128)
     val targetLocalBitrate = _targetLocalBitrate.asStateFlow()
-
-    private val _targetLocalQuality = MutableStateFlow(VideoQuality.Q720P)
-    val targetLocalQuality = _targetLocalQuality.asStateFlow()
 
     private val _conversionState = MutableStateFlow<ProcessingState>(ProcessingState.Idle)
     val conversionState = _conversionState.asStateFlow()
@@ -123,12 +134,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _targetDownloadFormat.value = format
     }
 
-    fun setTargetDownloadQuality(quality: VideoQuality) {
-        _targetDownloadQuality.value = quality
-    }
-
     fun setTargetDownloadSpeed(speed: Float) {
         _targetDownloadSpeed.value = speed
+    }
+
+    fun setTargetDownloadQuality(quality: VideoQuality) {
+        _targetDownloadQuality.value = quality
     }
 
     fun setTargetDownloadBitrate(bitrate: AudioBitrate) {
@@ -143,12 +154,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _targetLocalFormat.value = format
     }
 
-    fun setTargetLocalBitrate(bitrate: AudioBitrate) {
-        _targetLocalBitrate.value = bitrate
-    }
-
     fun setTargetLocalQuality(quality: VideoQuality) {
         _targetLocalQuality.value = quality
+    }
+
+    fun setTargetLocalBitrate(bitrate: AudioBitrate) {
+        _targetLocalBitrate.value = bitrate
     }
 
     fun showActionMessage(msg: String) {
@@ -176,18 +187,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _downloadState.value = DownloadState.FetchingMetadata(url)
             try {
                 val info = downloader.inspectUrl(url)
-                if (info.isPlaylist) {
+                if (info.items.isEmpty()) {
+                    _downloadState.value = DownloadState.Error(
+                        "تعذر استخراج عناصر من الرابط. تحقق من الرابط أو جرّب مرة أخرى."
+                    )
+                } else if (info.isPlaylist) {
                     _downloadState.value = DownloadState.PlaylistReady(
                         playlistTitle = info.playlistTitle,
                         items = info.items
                     )
-                } else if (info.items.isNotEmpty()) {
+                } else {
                     _downloadState.value = DownloadState.PlaylistReady(
                         playlistTitle = if (info.items[0].isVideo) "فيديو جاهز للتحميل" else "ملف جاهز للتحميل",
                         items = info.items
                     )
-                } else {
-                    _downloadState.value = DownloadState.Error("تعذر استخراج معلومات الرابط. يرجى التأكد من الرابط والمحاولة مجدداً.")
                 }
             } catch (e: Exception) {
                 _downloadState.value = DownloadState.Error("خطأ في الاتصال بالرابط: ${e.localizedMessage}")
@@ -214,8 +227,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Downloads selected items with duplicate check prompt:
-     * (تحميل على أي حال / تحميل واستبدال القديم / إلغاء)
+     * Plans and checks every selected output independently. Conflicts are presented one at a
+     * time; the selected action is stored only for that item and exact destination.
      */
     fun startDownload() {
         val state = _downloadState.value
@@ -230,47 +243,108 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val format = _targetDownloadFormat.value
-        val quality = _targetDownloadQuality.value
         val speed = _targetDownloadSpeed.value
+        val quality = _targetDownloadQuality.value
         val bitrate = _targetDownloadBitrate.value
+        val isVideoFormat = format == AudioFormat.MP4 || format == AudioFormat.MKV || format == AudioFormat.WEBM
+        val speedTag = if (kotlin.math.abs(speed - 1.0f) > 0.01f) "_${speed}x" else ""
+        val qualityTag = if (isVideoFormat) "_${quality.height}p" else ""
+        val filePlans = DownloadFilePlanner.plan(
+            titles = itemsToDownload.map { it.title },
+            extension = format.extension,
+            suffix = "$qualityTag$speedTag",
+            existingFileNames = downloader.existingOutputFileNames()
+        )
+        if (filePlans.size != itemsToDownload.size) {
+            _actionMessage.value = "تعذر تجهيز أسماء ملفات التحميل."
+            return
+        }
 
-        // Check if the first item already exists
-        val firstItem = itemsToDownload.first()
-        val cleanTitle = firstItem.title.replace(Regex("[^a-zA-Z0-9أ-ي_\\-\\s]"), "").trim().ifEmpty { "ملف" }
-        val speedTag = if (speed != 1.0f) "_${speed}x" else ""
-        val targetName = "$cleanTitle$speedTag.${format.extension}"
-
-        val existingFile = downloader.checkFileExists(targetName)
-        if (existingFile != null) {
-            // Prompt user with the 3 choices: (تحميل على اي حال / تحميل واستبدال القديم / الغاء)
-            _duplicateConflict.value = DuplicateConflict(
-                fileName = existingFile.name,
-                pendingAction = { choice ->
-                    if (choice != DuplicateAction.CANCEL) {
-                        executeDownload(itemsToDownload, format, quality, speed, bitrate, choice)
-                    } else {
-                        _actionMessage.value = "تم إلغاء التحميل"
-                    }
-                }
-            )
+        val requests = itemsToDownload.zip(filePlans) { item, plan ->
+            PlannedDownloadRequest(item = item, filePlan = plan)
+        }
+        val conflictIndices = requests.indices.filter { requests[it].filePlan.conflictsWithExistingFile }
+        if (conflictIndices.isEmpty()) {
+            executeDownload(requests, format, speed, quality, bitrate)
         } else {
-            executeDownload(itemsToDownload, format, quality, speed, bitrate, DuplicateAction.DOWNLOAD_ANYWAY)
+            promptForNextConflict(
+                requests = requests,
+                conflictIndices = conflictIndices,
+                conflictCursor = 0,
+                decisions = mutableMapOf(),
+                format = format,
+                speed = speed,
+                quality = quality,
+                bitrate = bitrate
+            )
         }
     }
 
-    private fun executeDownload(
-        itemsToDownload: List<PlaylistItem>,
+    private fun promptForNextConflict(
+        requests: List<PlannedDownloadRequest>,
+        conflictIndices: List<Int>,
+        conflictCursor: Int,
+        decisions: MutableMap<Int, DuplicateAction>,
         format: AudioFormat,
-        quality: VideoQuality,
         speed: Float,
-        bitrate: AudioBitrate,
-        duplicateAction: DuplicateAction
+        quality: VideoQuality,
+        bitrate: AudioBitrate
+    ) {
+        if (conflictCursor >= conflictIndices.size) {
+            val finalizedRequests = requests.mapIndexed { index, request ->
+                request.copy(
+                    duplicateAction = request.filePlan.actionFor(
+                        decisions[index] ?: DuplicateAction.DOWNLOAD_ANYWAY
+                    )
+                )
+            }
+            _duplicateConflict.value = null
+            executeDownload(finalizedRequests, format, speed, quality, bitrate)
+            return
+        }
+
+        val requestIndex = conflictIndices[conflictCursor]
+        val request = requests[requestIndex]
+        _duplicateConflict.value = DuplicateConflict(
+            fileName = request.filePlan.targetFileName,
+            itemTitle = request.item.title,
+            conflictIndex = conflictCursor + 1,
+            conflictCount = conflictIndices.size,
+            pendingAction = { choice ->
+                _duplicateConflict.value = null
+                if (choice == DuplicateAction.CANCEL) {
+                    _actionMessage.value = "تم إلغاء التحميل"
+                } else {
+                    decisions[requestIndex] = choice
+                    promptForNextConflict(
+                        requests = requests,
+                        conflictIndices = conflictIndices,
+                        conflictCursor = conflictCursor + 1,
+                        decisions = decisions,
+                        format = format,
+                        speed = speed,
+                        quality = quality,
+                        bitrate = bitrate
+                    )
+                }
+            }
+        )
+    }
+
+    private fun executeDownload(
+        requests: List<PlannedDownloadRequest>,
+        format: AudioFormat,
+        speed: Float,
+        quality: VideoQuality,
+        bitrate: AudioBitrate
     ) {
         viewModelScope.launch {
             val downloadedList = mutableListOf<MediaItem>()
-            val total = itemsToDownload.size
+            var failedCount = 0
+            val total = requests.size
 
-            for ((index, item) in itemsToDownload.withIndex()) {
+            for ((index, request) in requests.withIndex()) {
+                val item = request.item
                 _downloadState.value = DownloadState.Downloading(
                     currentItemTitle = item.title,
                     currentIndex = index + 1,
@@ -283,10 +357,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val result = downloader.downloadAndProcessItem(
                     item = item,
                     targetFormat = format,
-                    targetQuality = quality,
                     targetSpeed = speed,
+                    targetQuality = quality,
                     targetBitrate = bitrate,
-                    duplicateAction = duplicateAction,
+                    duplicateAction = request.duplicateAction,
+                    outputFileName = request.filePlan.outputFileNameFor(request.duplicateAction),
                     onDownloadProgress = { progress, downloaded, totalBytes ->
                         _downloadState.value = DownloadState.Downloading(
                             currentItemTitle = item.title,
@@ -309,11 +384,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (result != null) {
                     repository.addItem(result)
                     downloadedList.add(result)
+                } else {
+                    failedCount++
                 }
             }
 
-            _downloadState.value = DownloadState.Completed(downloadedList)
-            _actionMessage.value = "تم تحميل ${downloadedList.size} ملف بنجاح في File Station!"
+            if (downloadedList.isEmpty()) {
+                _downloadState.value = DownloadState.Error("فشل تحميل جميع العناصر المحددة. لم يتم حفظ ملفات.")
+                _actionMessage.value = "فشل التحميل؛ لم يُحفظ أي ملف. تحقق من الرابط والاتصال ثم أعد المحاولة."
+            } else {
+                _downloadState.value = DownloadState.Completed(downloadedList, failedCount)
+                _actionMessage.value = if (failedCount == 0) {
+                    "تم تحميل ${downloadedList.size} ملف بنجاح في File Station."
+                } else {
+                    "تم تحميل ${downloadedList.size} ملف، وفشل تحميل $failedCount عنصر."
+                }
+            }
         }
     }
 
@@ -351,14 +437,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val meta = _selectedLocalMetadata.value
         val speed = _targetLocalSpeed.value
+        val quality = _targetLocalQuality.value
         val format = _targetLocalFormat.value
         val bitrate = _targetLocalBitrate.value
-        val quality = _targetLocalQuality.value
 
         viewModelScope.launch {
             val isVideoOutput = format == AudioFormat.MP4 || format == AudioFormat.MKV || format == AudioFormat.WEBM
             val isVideoSource = meta?.isVideo == true
-
+            if (isVideoOutput && !isVideoSource) {
+                _conversionState.value = ProcessingState.Error("صيغة الفيديو تتطلب مصدرًا يحتوي على مسار فيديو.")
+                return@launch
+            }
             _conversionState.value = ProcessingState.Processing(0.05f, "بدء تحويل الملف...")
 
             val outputDir = File(getApplication<Application>().filesDir, "converted_audio").apply { mkdirs() }
@@ -366,56 +455,76 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .replace(Regex("[^a-zA-Z0-9أ-ي_\\-\\s]"), "")
                 .trim()
                 .ifEmpty { "ملف" }
-            val speedLabel = if (speed != 1.0f) "_${speed}x" else ""
-            val qualityLabel = if (isVideoOutput) "_${quality.height}p" else "_${bitrate.label}"
-            val outputFile = File(outputDir, "${cleanTitle}${speedLabel}${qualityLabel}.${format.extension}")
+            val videoLabel = if (isVideoOutput) "_video_${speed}x" else ""
+            val speedLabel = if (!isVideoOutput && speed != 1.0f) "_${speed}x" else ""
+            val qualityLabel = if (!isVideoOutput) "_${bitrate.label}" else ""
+            val uniqueSuffix = UUID.randomUUID().toString().take(8)
+            val outputFile = File(outputDir, "${cleanTitle}${videoLabel}${speedLabel}${qualityLabel}_$uniqueSuffix.${format.extension}")
 
-            // If source is video and user wants to downscale video quality (e.g. 1080p -> 720p, 480p, 360p)
+            // Copy the selected content URI to a private temporary file, then use Media3 to
+            // decode, scale and re-encode the video at the requested speed.
             if (isVideoSource && isVideoOutput) {
-                // Copy stream to temp file to transcode
-                val tempSourceFile = File(outputDir, "temp_src_${UUID.randomUUID()}.mp4")
-                try {
-                    getApplication<Application>().contentResolver.openInputStream(uri)?.use { input ->
-                        tempSourceFile.outputStream().use { output -> input.copyTo(output) }
-                    }
-                } catch (_: Exception) {}
+                val tempSourceFile = File(outputDir, "temp_src_${UUID.randomUUID()}")
+                val copied = try {
+                    val input = getApplication<Application>().contentResolver.openInputStream(uri)
+                        ?: throw IllegalStateException("تعذر فتح الملف المحدد")
+                    input.use { source -> tempSourceFile.outputStream().use { output -> source.copyTo(output) } }
+                    tempSourceFile.isFile && tempSourceFile.length() > 0L
+                } catch (e: Exception) {
+                    android.util.Log.e("MainViewModel", "Unable to stage selected video", e)
+                    false
+                }
+                if (!copied) {
+                    tempSourceFile.delete()
+                    _conversionState.value = ProcessingState.Error("تعذر قراءة ملف الفيديو المحدد؛ لم يُنشأ ملف ناتج.")
+                    return@launch
+                }
 
-                val success = videoTranscoder.downscaleVideo(
-                    sourceFile = tempSourceFile,
-                    outputFile = outputFile,
-                    targetQuality = quality,
-                    onProgress = { progress, stage ->
-                        _conversionState.value = ProcessingState.Processing(progress, stage)
-                    }
-                )
-                tempSourceFile.delete()
+                val outputInfo = try {
+                    videoTranscoder.transcodeVideo(
+                        sourceFile = tempSourceFile,
+                        outputFile = outputFile,
+                        targetQuality = quality,
+                        targetSpeed = speed,
+                        onProgress = { progress, stage ->
+                            _conversionState.value = ProcessingState.Processing(progress, stage)
+                        }
+                    )
+                } finally {
+                    tempSourceFile.delete()
+                }
 
-                if (success && outputFile.exists()) {
+                if (outputInfo != null && outputFile.isFile && outputFile.length() > 0L) {
+                    val actualResolution = "${outputInfo.width} × ${outputInfo.height}"
+                    val outputDurationMs = outputInfo.durationUs / 1000L
                     val newItem = MediaItem(
                         id = UUID.randomUUID().toString(),
-                        title = "${cleanTitle} (${quality.label})",
+                        title = "$cleanTitle ($actualResolution, ${speed}x)",
                         filePath = outputFile.absolutePath,
-                        durationMs = meta?.durationMs ?: 0L,
+                        durationMs = outputDurationMs,
                         originalDurationMs = meta?.durationMs ?: 0L,
-                        speed = 1.0f,
+                        speed = speed,
                         format = format.name,
                         fileSize = outputFile.length(),
                         isVideo = true,
                         fileType = FileType.VIDEO,
-                        resolutionText = quality.label,
+                        resolutionText = "${minOf(outputInfo.width, outputInfo.height)}p ($actualResolution)",
+                        bitrateKbps = outputInfo.bitRate.takeIf { it > 0 }?.div(1000) ?: 0,
                         sourceUrl = uri.toString()
                     )
                     repository.addItem(newItem)
                     _conversionState.value = ProcessingState.Success(
                         newItem,
-                        "تم تقليل جودة وتحويل الفيديو بنجاح إلى ${quality.label}!"
+                        "أُعيد ترميز الفيديو فعليًا إلى ${actualResolution} بسرعة ${speed}x داخل ${format.extension.uppercase()}."
                     )
-                    _actionMessage.value = "تم تحويل الفيديو وحفظه بنجاح!"
+                    _actionMessage.value = "اكتمل تغيير الدقة/السرعة وإعادة الترميز؛ الدقة الفعلية ${actualResolution}."
                 } else {
-                    _conversionState.value = ProcessingState.Error("فشلت عملية معالجة الفيديو.")
+                    outputFile.delete()
+                    _conversionState.value = ProcessingState.Error("فشلت إعادة ترميز الفيديو. تحقق من دعم الجهاز للترميز ثم أعد المحاولة؛ لم يُحفظ ملف جزئي.")
                 }
             } else {
                 // Audio conversion or extracting audio from video with WSOLA speed & bitrate
+                var audioOutputInfo: AudioTranscoder.AudioOutputInfo? = null
                 val success = transcoder.transcodeAudio(
                     sourceUri = uri,
                     sourceFile = null,
@@ -425,17 +534,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     bitrateKbps = bitrate.kbps,
                     onProgress = { progress, stage ->
                         _conversionState.value = ProcessingState.Processing(progress, stage)
-                    }
+                    },
+                    onOutputInfo = { audioOutputInfo = it }
                 )
 
                 if (success && outputFile.exists()) {
+                    val effectiveBitrateKbps = audioOutputInfo?.appliedBitrateKbps ?: bitrate.kbps
+                    val bitrateText = if (format == AudioFormat.WAV) {
+                        "$effectiveBitrateKbps kbps PCM"
+                    } else {
+                        "$effectiveBitrateKbps kbps"
+                    }
+                    val adjustmentDetails = audioOutputInfo?.let { info ->
+                        buildList {
+                            if (info.requestWasAdjusted) {
+                                add("المطلوب ${info.requestedBitrateKbps} kbps، والمطبق ${info.appliedBitrateKbps} kbps")
+                            }
+                            if (info.sampleRate != info.sourceSampleRate || info.channels != info.sourceChannels) {
+                                add("تهيأت العينة إلى ${info.sampleRate} Hz / ${info.channels} قناة")
+                            }
+                        }
+                    }.orEmpty()
+                    val adjustmentText = if (adjustmentDetails.isEmpty()) "" else " (${adjustmentDetails.joinToString("؛ ")})"
                     val finalDuration = if (meta != null && meta.durationMs > 0 && speed > 0) {
                         (meta.durationMs / speed).toLong()
                     } else 0L
 
                     val newItem = MediaItem(
                         id = UUID.randomUUID().toString(),
-                        title = "${cleanTitle} (${speed}x, ${bitrate.label})",
+                        title = "${cleanTitle} (${speed}x, $bitrateText)",
                         filePath = outputFile.absolutePath,
                         durationMs = finalDuration,
                         originalDurationMs = meta?.durationMs ?: 0L,
@@ -444,13 +571,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         fileSize = outputFile.length(),
                         isVideo = false,
                         fileType = FileType.AUDIO,
-                        bitrateKbps = bitrate.kbps,
+                        bitrateKbps = effectiveBitrateKbps,
                         sourceUrl = uri.toString()
                     )
                     repository.addItem(newItem)
                     _conversionState.value = ProcessingState.Success(
                         newItem,
-                        "تم استخراج وتحويل الصوت بنجاح بصيغة ${format.name} ومعدل ${bitrate.label}!"
+                        "تم استخراج وتحويل الصوت بنجاح بصيغة ${format.name} بمعدل $bitrateText$adjustmentText!"
                     )
                     _actionMessage.value = "تم تحويل الملف بنجاح! جاهز للاستماع والمشاركة."
                 } else {

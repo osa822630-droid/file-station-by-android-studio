@@ -4,6 +4,8 @@ import android.content.ClipboardManager
 import android.content.Context
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -52,8 +54,8 @@ fun DownloadScreen(
     val downloadUrl by viewModel.downloadUrl.collectAsState()
     val downloadState by viewModel.downloadState.collectAsState()
     val targetFormat by viewModel.targetDownloadFormat.collectAsState()
-    val targetQuality by viewModel.targetDownloadQuality.collectAsState()
     val targetSpeed by viewModel.targetDownloadSpeed.collectAsState()
+    val targetQuality by viewModel.targetDownloadQuality.collectAsState()
     val targetBitrate by viewModel.targetDownloadBitrate.collectAsState()
 
     var showGuideDialog by remember { mutableStateOf(false) }
@@ -107,7 +109,7 @@ fun DownloadScreen(
                             color = MaterialTheme.colorScheme.onPrimaryContainer
                         )
                         Text(
-                            text = "تحميل الفيديوهات بجميع الجودات (1080p - 240p) وصوتيات MP3/WAV مع خيارات السرعة المتعددة.",
+                            text = "إعادة ترميز الفيديو لتغيير الدقة والسرعة مع الحفاظ على تزامن الصوت والصورة؛ يتوفر استخراج MP3 وM4A/AAC وWAV.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
                         )
@@ -220,8 +222,8 @@ fun DownloadScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     SectionHeader(
-                        title = "إعدادات الجودة والصيغة والسرعة",
-                        subtitle = "اختر صيغة التحميل وجودة الفيديو وسرعة التشغيل المسبقة",
+                        title = "إعدادات التنزيل والصيغة",
+                        subtitle = "تُعاد معالجة الفيديو فعليًا لتطبيق حد الدقة والسرعة المختارين.",
                         icon = Icons.Default.Tune
                     )
 
@@ -236,14 +238,14 @@ fun DownloadScreen(
                     Spacer(modifier = Modifier.height(6.dp))
 
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         listOf(
                             AudioFormat.MP4 to "فيديو MP4",
                             AudioFormat.MKV to "فيديو MKV",
                             AudioFormat.MP3 to "صوت MP3",
-                            AudioFormat.M4A to "صوت M4A",
+                            AudioFormat.M4A to "صوت M4A (AAC)",
                             AudioFormat.WAV to "صوت WAV"
                         ).forEach { (fmt, label) ->
                             val isSelected = targetFormat == fmt
@@ -274,7 +276,7 @@ fun DownloadScreen(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = targetQuality.label,
+                                text = "حد أقصى ${targetQuality.height}p",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.primary
@@ -282,13 +284,12 @@ fun DownloadScreen(
                         }
                         Spacer(modifier = Modifier.height(6.dp))
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             VideoQuality.values().forEach { q ->
-                                val isSelected = targetQuality == q
                                 FilterChip(
-                                    selected = isSelected,
+                                    selected = targetQuality == q,
                                     onClick = { viewModel.setTargetDownloadQuality(q) },
                                     label = { Text(q.label.substringBefore(" ")) },
                                     colors = FilterChipDefaults.filterChipColors(
@@ -298,6 +299,19 @@ fun DownloadScreen(
                                 )
                             }
                         }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "تُستخدم الدقة المختارة كحد أقصى مع الحفاظ على تناسب الأبعاد، ولا تُكبّر المصادر الأصغر.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else if (targetFormat == AudioFormat.WAV) {
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = "WAV يحفظ الصوت PCM غير المضغوط؛ معدل البت تحدده العينة والقنوات ولا ينطبق عليه اختيار ضغط MP3/AAC.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     } else {
                         // Audio Bitrate Options (48k, 64k, 128k, 192k, 256k, 320k)
                         Spacer(modifier = Modifier.height(14.dp))
@@ -352,7 +366,7 @@ fun DownloadScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "سرعة التشغيل المطلوبة للملف:",
+                            text = if (isVideo) "سرعة الفيديو:" else "سرعة الصوت الناتج:",
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.Bold
                         )
@@ -366,7 +380,7 @@ fun DownloadScreen(
 
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f).forEach { s ->
@@ -374,6 +388,7 @@ fun DownloadScreen(
                             FilterChip(
                                 selected = isSelected,
                                 onClick = { viewModel.setTargetDownloadSpeed(s) },
+                                enabled = true,
                                 label = { Text("${s}x") },
                                 colors = FilterChipDefaults.filterChipColors(
                                     selectedContainerColor = MaterialTheme.colorScheme.primary,
@@ -381,6 +396,14 @@ fun DownloadScreen(
                                 )
                             )
                         }
+                    }
+                    if (isVideo) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "تُعاد مزامنة الصوت والصورة عند السرعة المختارة، مع الحفاظ على نبرة الصوت قدر الإمكان.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
             }
@@ -624,13 +647,17 @@ fun DownloadScreen(
                             )
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                text = "تم اكتمال التحميل والمعالجة بنجاح!",
+                                text = if (state.failedCount == 0) "اكتمل التحميل والمعالجة بنجاح" else "اكتمل التحميل جزئيًا",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer
                             )
                             Text(
-                                text = "تم حفظ ${state.downloadedItems.size} ملف في محطة الملفات جاهزة للتشغيل والتصدير.",
+                                text = if (state.failedCount == 0) {
+                                    "تم حفظ ${state.downloadedItems.size} ملف في محطة الملفات."
+                                } else {
+                                    "تم حفظ ${state.downloadedItems.size} ملف، وفشل تحميل ${state.failedCount} عنصر. راجع الروابط الفاشلة وحاول مجددًا."
+                                },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer
                             )
@@ -671,7 +698,7 @@ fun DownloadScreen(
                             )
                             Spacer(modifier = Modifier.height(10.dp))
                             TextButton(onClick = { viewModel.resetDownloadState() }) {
-                                Text("إعادة المحاولة")
+                                Text("إغلاق")
                             }
                         }
                     }
