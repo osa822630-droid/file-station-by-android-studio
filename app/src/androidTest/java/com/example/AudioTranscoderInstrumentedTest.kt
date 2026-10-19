@@ -1,5 +1,7 @@
 package com.example
 
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -29,6 +31,21 @@ class AudioTranscoderInstrumentedTest {
         val output = File(context.cacheDir, "m4a-output-$id.m4a")
         val roundTripOutput = File(context.cacheDir, "m4a-roundtrip-$id.m4a")
         val sampleRate = 44_100
+        val supports320KbpsMonoAac = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { codec ->
+            if (!codec.isEncoder || codec.supportedTypes.none { it.equals("audio/mp4a-latm", ignoreCase = true) }) {
+                false
+            } else {
+                runCatching {
+                    val capabilities = codec.getCapabilitiesForType("audio/mp4a-latm")
+                    val hasAacLc = capabilities.profileLevels.isEmpty() || capabilities.profileLevels.any {
+                        it.profile == MediaCodecInfo.CodecProfileLevel.AACObjectLC
+                    }
+                    val audio = capabilities.audioCapabilities
+                    hasAacLc && audio != null && audio.isSampleRateSupported(sampleRate) &&
+                        audio.maxInputChannelCount >= 1 && 320_000 in audio.bitrateRange
+                }.getOrDefault(false)
+            }
+        }
         val samples = ShortArray(sampleRate) { i ->
             (sin(2.0 * PI * 440.0 * i / sampleRate) * 12_000).toInt().toShort()
         }
@@ -46,7 +63,7 @@ class AudioTranscoderInstrumentedTest {
                 outputFile = output,
                 targetSpeed = 1.0f,
                 targetFormat = AudioFormat.M4A,
-                bitrateKbps = 128,
+                bitrateKbps = 320,
                 onOutputInfo = { outputInfo = it }
             ) { _, _ -> }
 
@@ -67,6 +84,11 @@ class AudioTranscoderInstrumentedTest {
             val actualAudioTrack = audioTrack ?: throw AssertionError("M4A should contain an audio track")
             assertEquals("audio/mp4a-latm", actualAudioTrack.getString(MediaFormat.KEY_MIME))
             assertNotNull("The transcoder should report negotiated output metadata", outputInfo)
+            assertEquals(320, outputInfo!!.requestedBitrateKbps)
+            assertTrue(outputInfo!!.appliedBitrateKbps in 32..320)
+            if (supports320KbpsMonoAac) {
+                assertEquals(320, outputInfo!!.appliedBitrateKbps)
+            }
             assertEquals(actualAudioTrack.getInteger(MediaFormat.KEY_SAMPLE_RATE), outputInfo!!.sampleRate)
             assertEquals(actualAudioTrack.getInteger(MediaFormat.KEY_CHANNEL_COUNT), outputInfo!!.channels)
             extractor.release()
@@ -78,7 +100,7 @@ class AudioTranscoderInstrumentedTest {
                 outputFile = roundTripOutput,
                 targetSpeed = 1.0f,
                 targetFormat = AudioFormat.M4A,
-                bitrateKbps = 128,
+                bitrateKbps = 320,
                 onOutputInfo = { roundTripInfo = it }
             ) { _, _ -> }
             assertTrue("M4A-to-M4A decode and re-encode should succeed", roundTripSuccess)
@@ -89,6 +111,11 @@ class AudioTranscoderInstrumentedTest {
                 .firstOrNull { (it.getString(MediaFormat.KEY_MIME) ?: "").startsWith("audio/") }
                 ?: throw AssertionError("Round-trip M4A should contain an audio track")
             assertNotNull(roundTripInfo)
+            assertEquals(320, roundTripInfo!!.requestedBitrateKbps)
+            assertTrue(roundTripInfo!!.appliedBitrateKbps in 32..320)
+            if (supports320KbpsMonoAac) {
+                assertEquals(320, roundTripInfo!!.appliedBitrateKbps)
+            }
             assertEquals(roundTripTrack.getInteger(MediaFormat.KEY_SAMPLE_RATE), roundTripInfo!!.sampleRate)
             assertEquals(roundTripTrack.getInteger(MediaFormat.KEY_CHANNEL_COUNT), roundTripInfo!!.channels)
         } finally {

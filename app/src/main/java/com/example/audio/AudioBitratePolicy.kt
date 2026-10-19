@@ -15,11 +15,12 @@ object AudioBitratePolicy {
     ): Int? {
         if (sampleRate <= 0 || channels <= 0) return null
         return when (format) {
+            // MPEG-2/2.5 Layer III cannot represent 320 kbps at these lower sample rates.
             AudioFormat.MP3 -> requestedKbps.coerceIn(8, if (sampleRate < 32_000) 160 else 320)
-            AudioFormat.M4A -> {
-                val outputChannels = if (channels <= 2) channels else 1
-                requestedKbps.coerceIn(32, if (outputChannels == 1) 96 else 160)
-            }
+            // Do not impose a mono/stereo quality cap here. The selected platform AAC encoder's
+            // advertised bitrate range is authoritative; selectAacEncoderSettings clamps to that
+            // range and reports the applied bitrate back to the UI/library.
+            AudioFormat.M4A -> requestedKbps.coerceIn(32, 320)
             AudioFormat.WAV -> {
                 (sampleRate.toLong() * channels * 16L / 1_000L)
                     .coerceAtMost(Int.MAX_VALUE.toLong())

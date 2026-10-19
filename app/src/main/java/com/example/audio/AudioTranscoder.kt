@@ -520,6 +520,18 @@ class AudioTranscoder(private val context: Context) {
 
         for (sampleRate in sampleRates) {
             for (channels in channelCounts) {
+                val policyBitrateKbps = AudioBitratePolicy.appliedKbps(
+                    format = AudioFormat.M4A,
+                    requestedKbps = requestedBitrateKbps,
+                    sampleRate = sampleRate,
+                    channels = channels
+                ) ?: continue
+                val requestedBps = policyBitrateKbps * 1000
+                var bestSettings: AacEncoderSettings? = null
+                var bestBitrateDistance = Long.MAX_VALUE
+
+                // Check every AAC-LC encoder for this sample-rate/channel layout before
+                // accepting a lower bitrate. Device codecs often advertise different ranges.
                 for (codecInfo in codecs) {
                     val capabilities = try {
                         codecInfo.getCapabilitiesForType(mime)
@@ -533,25 +545,25 @@ class AudioTranscoder(private val context: Context) {
                     val audioCapabilities = capabilities.audioCapabilities ?: continue
                     if (!audioCapabilities.isSampleRateSupported(sampleRate) ||
                         channels > audioCapabilities.maxInputChannelCount) continue
-                    val policyBitrateKbps = AudioBitratePolicy.appliedKbps(
-                        format = AudioFormat.M4A,
-                        requestedKbps = requestedBitrateKbps,
-                        sampleRate = sampleRate,
-                        channels = channels
-                    ) ?: continue
-                    val requestedBps = policyBitrateKbps * 1000
+
                     val bitrateRange = audioCapabilities.bitrateRange
                     val bitrateBps = requestedBps.coerceIn(bitrateRange.lower, bitrateRange.upper)
                     if (bitrateBps <= 0) continue
-                    val appliedKbps = ((bitrateBps + 500) / 1000).coerceAtLeast(1)
-                    return AacEncoderSettings(
-                        codecName = codecInfo.name,
-                        sampleRate = sampleRate,
-                        channels = channels,
-                        bitrateKbps = appliedKbps,
-                        bitrateBps = bitrateBps
-                    )
+                    val distance = kotlin.math.abs(bitrateBps.toLong() - requestedBps.toLong())
+                    if (distance < bestBitrateDistance) {
+                        val appliedKbps = ((bitrateBps + 500) / 1000).coerceAtLeast(1)
+                        bestSettings = AacEncoderSettings(
+                            codecName = codecInfo.name,
+                            sampleRate = sampleRate,
+                            channels = channels,
+                            bitrateKbps = appliedKbps,
+                            bitrateBps = bitrateBps
+                        )
+                        bestBitrateDistance = distance
+                        if (distance == 0L) break
+                    }
                 }
+                if (bestSettings != null) return bestSettings
             }
         }
         return null

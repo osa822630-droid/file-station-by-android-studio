@@ -8,19 +8,21 @@ import org.junit.Test
 
 class AudioBitratePolicyTest {
     @Test
-    fun aacStereoReportsItsAppliedMaximumRatherThanTheRequestedRate() {
-        assertEquals(160, AudioBitratePolicy.appliedKbps(AudioFormat.M4A, 320, 44_100, 2))
-    }
-
-    @Test
-    fun aacMonoAndDownmixedMultichannelUseTheMonoLimit() {
-        assertEquals(96, AudioBitratePolicy.appliedKbps(AudioFormat.M4A, 320, 48_000, 1))
-        assertEquals(96, AudioBitratePolicy.appliedKbps(AudioFormat.M4A, 320, 48_000, 6))
+    fun aacPreservesHighestUiBitrateForMonoStereoAndDownmixedSources() {
+        assertEquals(320, AudioBitratePolicy.appliedKbps(AudioFormat.M4A, 320, 44_100, 1))
+        assertEquals(320, AudioBitratePolicy.appliedKbps(AudioFormat.M4A, 320, 44_100, 2))
+        assertEquals(320, AudioBitratePolicy.appliedKbps(AudioFormat.M4A, 320, 48_000, 6))
     }
 
     @Test
     fun aacRequestWithinTheSupportedRangeIsPreserved() {
         assertEquals(128, AudioBitratePolicy.appliedKbps(AudioFormat.M4A, 128, 48_000, 2))
+    }
+
+    @Test
+    fun aacPolicyBoundsOutOfRangeRequests() {
+        assertEquals(32, AudioBitratePolicy.appliedKbps(AudioFormat.M4A, 8, 48_000, 2))
+        assertEquals(320, AudioBitratePolicy.appliedKbps(AudioFormat.M4A, 512, 48_000, 2))
     }
 
     @Test
