@@ -82,7 +82,6 @@ val keytoolName = if (System.getProperty("os.name").startsWith("Windows", ignore
 val keytoolFile = rootProject.file("${System.getProperty("java.home")}/bin/$keytoolName")
 val ensureDebugKeystore = tasks.register<Exec>("ensureDebugKeystore") {
   outputs.file(debugKeystoreFile)
-  onlyIf { !debugKeystoreFile.exists() }
   executable(keytoolFile.absolutePath)
   args(
     "-genkeypair",
