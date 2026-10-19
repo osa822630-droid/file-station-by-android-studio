@@ -42,6 +42,13 @@ jobs:
           :app:compileDebugAndroidTestKotlin :app:assembleDebugAndroidTest
           --no-daemon --max-workers=2
 
+      - name: Verify generated debug keystore is up-to-date
+        run: |
+          test -s debug.keystore
+          output="$(./gradlew :app:ensureDebugKeystore --no-daemon --max-workers=2 2>&1)"
+          printf '%s\n' "$output"
+          grep -Fq '> Task :app:ensureDebugKeystore UP-TO-DATE' <<< "$output"
+
       - name: Upload JVM and lint reports
         if: always()
         uses: actions/upload-artifact@v4
