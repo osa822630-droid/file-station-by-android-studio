@@ -15,4 +15,9 @@
 .cxx
 local.properties
 .env
-debug.keystore
+
+# Local Android signing credentials. Never commit development or release keys.
+*.keystore
+*.jks
+*.p12
+*.pfx

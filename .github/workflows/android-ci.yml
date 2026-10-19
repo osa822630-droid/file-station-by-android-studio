@@ -36,18 +36,6 @@ jobs:
           yes | sdkmanager --licenses
           sdkmanager "platforms;android-36.1" "build-tools;36.1.0" "platform-tools"
 
-      - name: Create temporary debug signing key
-        run: |
-          keytool -genkeypair -v \
-            -keystore debug.keystore \
-            -storepass android \
-            -keypass android \
-            -alias androiddebugkey \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
-
       - name: Run JVM tests, lint, and build Android test APK
         run: >-
           ./gradlew :app:testDebugUnitTest :app:lintDebug
@@ -97,18 +85,6 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           test -e /dev/kvm
-
-      - name: Create temporary debug signing key
-        run: |
-          keytool -genkeypair -v \
-            -keystore debug.keystore \
-            -storepass android \
-            -keypass android \
-            -alias androiddebugkey \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
 
       - name: Run Android Instrumented tests
         uses: reactivecircus/android-emulator-runner@v2

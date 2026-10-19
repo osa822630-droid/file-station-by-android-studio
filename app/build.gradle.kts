@@ -70,6 +70,50 @@ android {
   }
 }
 
+// Preserve the AI Studio debug signing configuration while making clean local builds self-contained.
+// The generated key is local-only and is excluded from Git.
+val debugKeystoreFile = rootProject.file("debug.keystore")
+val ensureDebugKeystore = tasks.register("ensureDebugKeystore") {
+  outputs.file(debugKeystoreFile)
+  onlyIf { !debugKeystoreFile.exists() }
+  doLast {
+    val keytoolName = if (System.getProperty("os.name").startsWith("Windows", ignoreCase = true)) {
+      "keytool.exe"
+    } else {
+      "keytool"
+    }
+    val keytool = rootProject.file("${System.getProperty("java.home")}/bin/$keytoolName")
+    check(keytool.isFile) { "Cannot create the local debug keystore: keytool was not found at ${keytool.absolutePath}" }
+    project.exec {
+      commandLine(
+        keytool.absolutePath,
+        "-genkeypair",
+        "-v",
+        "-keystore",
+        debugKeystoreFile.absolutePath,
+        "-storepass",
+        "android",
+        "-keypass",
+        "android",
+        "-alias",
+        "androiddebugkey",
+        "-keyalg",
+        "RSA",
+        "-keysize",
+        "2048",
+        "-validity",
+        "10000",
+        "-dname",
+        "CN=Android Debug,O=Android,C=US"
+      )
+    }
+  }
+}
+
+tasks.matching { it.name == "preDebugBuild" }.configureEach {
+  dependsOn(ensureDebugKeystore)
+}
+
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
 // to match the convention used in Web projects.
 secrets {

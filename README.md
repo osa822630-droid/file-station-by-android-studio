@@ -54,7 +54,7 @@ app/build/outputs/apk/debug/app-debug.apk
 
 يمكن فتح مجلد المشروع مباشرةً في Android Studio؛ سيستخدم Android Studio ملفات Gradle Wrapper الموجودة في المستودع.
 
-> **ملاحظة توقيع:** إعداد Debug الحالي يشير إلى ملف `debug.keystore` في جذر المشروع، لكنه غير مضمن في Git؛ لذلك يحتاج بناء APK في هذا الإعداد إلى توفيره محليًا أو تعديل الإعداد ليستعمل Debug keystore الذي يديره Android Gradle Plugin. بناء Release يحتاج keystore وكلمات مرور صحيحة عبر متغيرات البيئة (`KEYSTORE_PATH` و`STORE_PASSWORD` و`KEY_PASSWORD`). لا ترفع أي keystore أو كلمات مرور إلى المستودع.
+> **ملاحظة توقيع:** قبل أول بناء Debug، ينشئ Gradle تلقائيًا `debug.keystore` محليًا إذا لم يكن موجودًا؛ الملف ومفاتيح التوقيع مستثناة من Git. بناء Release ما زال يحتاج keystore وكلمات مرور يوفّرها المطوّر عبر (`KEYSTORE_PATH` و`STORE_PASSWORD` و`KEY_PASSWORD`). لا ترفع أي keystore أو كلمات مرور إلى المستودع.
 
 ## الفحص والاختبارات
 
@@ -79,7 +79,7 @@ app/build/outputs/apk/debug/app-debug.apk
 
 ## التكامل المستمر على GitHub
 
-يعرّف `.github/workflows/android-ci.yml` فحصًا تلقائيًا عند كل `push` أو Pull Request إلى `main`، ويمكن تشغيله يدويًا من تبويب Actions. يشغّل اختبارات JVM وLint ويبني APK الاختبارات، ثم يشغّل Android Instrumented على محاكي API 36 فوق Ubuntu 24.04 مع تفعيل KVM. ينشئ المفتاح المحلي المؤقت أثناء الـworkflow ويحذفه بانتهاء الـrunner؛ لا يحتاج workflow إلى PAT أو keystore محفوظ كـSecret.
+يعرّف `.github/workflows/android-ci.yml` فحصًا تلقائيًا عند كل `push` أو Pull Request إلى `main`، ويمكن تشغيله يدويًا من تبويب Actions. يشغّل اختبارات JVM وLint ويبني APK الاختبارات، ثم يشغّل Android Instrumented على محاكي API 36 فوق Ubuntu 24.04 مع تفعيل KVM. يولّد Gradle مفتاح Debug محليًا عند أول بناء يحتاجه؛ يحذفه انتهاء الـrunner المؤقت، ولا يحتاج workflow إلى PAT أو keystore محفوظ كـSecret.
 
 ## بنية المشروع
 
