@@ -39,7 +39,6 @@ import com.example.model.VideoQuality
 import com.example.ui.MainViewModel
 import com.example.ui.components.FeaturePhoneGuideDialog
 import com.example.ui.components.SectionHeader
-import com.example.ui.theme.EmeraldSuccess
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -72,7 +71,7 @@ fun DownloadScreen(
         contentPadding = PaddingValues(top = 16.dp, bottom = 120.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Red Hero Card
+        // Calm tinted hero card
         item {
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
@@ -642,7 +641,7 @@ fun DownloadScreen(
                             Icon(
                                 Icons.Default.CheckCircle,
                                 contentDescription = null,
-                                tint = EmeraldSuccess,
+                                tint = MaterialTheme.colorScheme.tertiary,
                                 modifier = Modifier.size(48.dp)
                             )
                             Spacer(modifier = Modifier.height(8.dp))

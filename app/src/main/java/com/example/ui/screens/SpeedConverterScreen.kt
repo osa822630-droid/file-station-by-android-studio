@@ -36,7 +36,6 @@ import com.example.ui.components.SectionHeader
 import com.example.ui.components.SpeedBadge
 import com.example.ui.components.formatDuration
 import com.example.ui.components.formatFileSize
-import com.example.ui.theme.EmeraldSuccess
 
 @Composable
 fun SpeedConverterScreen(
@@ -75,7 +74,7 @@ fun SpeedConverterScreen(
             .padding(top = 16.dp, bottom = 120.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Red Hero Card
+        // Calm tinted hero card
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp),
@@ -483,7 +482,7 @@ fun SpeedConverterScreen(
                         Icon(
                             Icons.Default.CheckCircle,
                             contentDescription = null,
-                            tint = EmeraldSuccess,
+                            tint = MaterialTheme.colorScheme.tertiary,
                             modifier = Modifier.size(44.dp)
                         )
                         Spacer(modifier = Modifier.height(8.dp))

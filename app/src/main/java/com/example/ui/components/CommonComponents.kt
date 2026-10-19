@@ -16,8 +16,6 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.model.FileType
-import com.example.ui.theme.EmeraldSuccess
-import com.example.ui.theme.RedPrimary
 
 fun formatDuration(ms: Long): String {
     if (ms <= 0) return "00:00"
@@ -84,18 +82,18 @@ fun FormatBadge(
     val isVideo = format.equals("MP4", ignoreCase = true) || format.equals("MKV", ignoreCase = true) || format.equals("WEBM", ignoreCase = true)
     Surface(
         modifier = modifier,
-        color = if (isWav) EmeraldSuccess.copy(alpha = 0.18f)
-                else if (isVideo) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
-                else MaterialTheme.colorScheme.secondary.copy(alpha = 0.18f),
+        color = if (isWav) MaterialTheme.colorScheme.tertiaryContainer
+                else if (isVideo) MaterialTheme.colorScheme.primaryContainer
+                else MaterialTheme.colorScheme.secondaryContainer,
         shape = RoundedCornerShape(8.dp)
     ) {
         Text(
             text = format.uppercase(),
             style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.Bold,
-            color = if (isWav) EmeraldSuccess
-                    else if (isVideo) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.secondary,
+            color = if (isWav) MaterialTheme.colorScheme.onTertiaryContainer
+                    else if (isVideo) MaterialTheme.colorScheme.onPrimaryContainer
+                    else MaterialTheme.colorScheme.onSecondaryContainer,
             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
         )
     }

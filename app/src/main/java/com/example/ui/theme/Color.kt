@@ -2,28 +2,60 @@ package com.example.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-// Vibrant Red Palette (File Station)
-val RedPrimary = Color(0xFFDC2626) // Vivid Scarlet
-val RedPrimaryLight = Color(0xFFEF4444)
-val RedPrimaryDark = Color(0xFFB91C1C)
-val RedAccent = Color(0xFFFF4D4D)
+// Calm blue-gray and soft teal palette inspired by UI UX Pro Max's
+// productivity-tool guidance: restrained accents, neutral surfaces, and clear hierarchy.
+val LightPrimary = Color(0xFF355F75)
+val LightOnPrimary = Color(0xFFFFFFFF)
+val LightPrimaryContainer = Color(0xFFDCE8ED)
+val LightOnPrimaryContainer = Color(0xFF193744)
 
-val RedContainerDark = Color(0xFF5F1116)
-val RedContainerLight = Color(0xFFFEE2E2)
-val OnRedContainerLight = Color(0xFF7F1D1D)
+val LightSecondary = Color(0xFF536E7A)
+val LightOnSecondary = Color(0xFFFFFFFF)
+val LightSecondaryContainer = Color(0xFFE5EDF0)
+val LightOnSecondaryContainer = Color(0xFF263B44)
 
-val DarkBg = Color(0xFF120809) // Deep obsidian with rich red undertone
-val DarkSurface = Color(0xFF1C0D0F)
-val DarkSurfaceVariant = Color(0xFF2B1417)
-val DarkOnSurface = Color(0xFFFDF2F2)
-val DarkCardBorder = Color(0xFF4A1F24)
+val LightTertiary = Color(0xFF356B59)
+val LightOnTertiary = Color(0xFFFFFFFF)
+val LightTertiaryContainer = Color(0xFFDDECE4)
+val LightOnTertiaryContainer = Color(0xFF194333)
 
-val LightBg = Color(0xFFFFF7F7)
+val LightBackground = Color(0xFFF4F7F8)
+val LightOnBackground = Color(0xFF1E2930)
 val LightSurface = Color(0xFFFFFFFF)
-val LightSurfaceVariant = Color(0xFFFEE8E8)
-val LightOnSurface = Color(0xFF1F0B0D)
-val LightCardBorder = Color(0xFFFECACA)
+val LightOnSurface = Color(0xFF1E2930)
+val LightSurfaceVariant = Color(0xFFEBF0F2)
+val LightOnSurfaceVariant = Color(0xFF4B5B63)
+val LightOutline = Color(0xFF71818A)
 
-val CrimsonTertiary = Color(0xFFE11D48)
-val EmeraldSuccess = Color(0xFF10B981)
-val AmberWarning = Color(0xFFF59E0B)
+val LightError = Color(0xFFB42318)
+val LightOnError = Color(0xFFFFFFFF)
+val LightErrorContainer = Color(0xFFFDE8E7)
+val LightOnErrorContainer = Color(0xFF7A201B)
+
+val DarkPrimary = Color(0xFFA9CDD6)
+val DarkOnPrimary = Color(0xFF183943)
+val DarkPrimaryContainer = Color(0xFF2D4851)
+val DarkOnPrimaryContainer = Color(0xFFD9E9ED)
+
+val DarkSecondary = Color(0xFFB5C9CE)
+val DarkOnSecondary = Color(0xFF22373D)
+val DarkSecondaryContainer = Color(0xFF344A50)
+val DarkOnSecondaryContainer = Color(0xFFDEE9EC)
+
+val DarkTertiary = Color(0xFFA2CDB7)
+val DarkOnTertiary = Color(0xFF183C2D)
+val DarkTertiaryContainer = Color(0xFF244D3B)
+val DarkOnTertiaryContainer = Color(0xFFCDEBD8)
+
+val DarkBackground = Color(0xFF111A1F)
+val DarkOnBackground = Color(0xFFE3EAED)
+val DarkSurface = Color(0xFF19242A)
+val DarkOnSurface = Color(0xFFE3EAED)
+val DarkSurfaceVariant = Color(0xFF26343A)
+val DarkOnSurfaceVariant = Color(0xFFBFCDD2)
+val DarkOutline = Color(0xFF687982)
+
+val DarkError = Color(0xFFFFB4AB)
+val DarkOnError = Color(0xFF690005)
+val DarkErrorContainer = Color(0xFF93000A)
+val DarkOnErrorContainer = Color(0xFFFFDAD6)

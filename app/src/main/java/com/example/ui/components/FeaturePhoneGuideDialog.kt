@@ -17,7 +17,6 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
-import com.example.ui.theme.EmeraldSuccess
 
 @Composable
 fun FileStationGuideDialog(
@@ -89,7 +88,7 @@ fun FileStationGuideDialog(
 
                 StationGuideCard(
                     icon = Icons.Default.Search,
-                    iconTint = EmeraldSuccess,
+                    iconTint = MaterialTheme.colorScheme.tertiary,
                     title = "محرك البحث الشامل (Google & YouTube)",
                     description = "ابحث مباشرة عن أي فيديو أو مقطع أو مستند عبر محرك البحث المدمج وقم بالتحميل الفوري بضغطة زر واحدة دون الحاجة لمغادرة التطبيق."
                 )
