@@ -826,8 +826,10 @@ class AudioTranscoder(private val context: Context) {
 
                             val remainingFrames = totalFrames - framesSubmitted
                             if (remainingFrames == 0L) {
+                                // API 29 AAC encoders may emit a final packet using the EOS timestamp.
+                                val endOfStreamTimeUs = framesSubmitted * 1_000_000L / sampleRate
                                 encoder.queueInputBuffer(
-                                    inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                    inputIndex, 0, 0, endOfStreamTimeUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM
                                 )
                                 inputEos = true
                             } else {
@@ -838,8 +840,9 @@ class AudioTranscoder(private val context: Context) {
                                     (pcmChunk.size / frameBytes).toLong()
                                 ).toInt()
                                 if (framesToWrite <= 0) {
+                                    val endOfStreamTimeUs = framesSubmitted * 1_000_000L / sampleRate
                                     encoder.queueInputBuffer(
-                                        inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                        inputIndex, 0, 0, endOfStreamTimeUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM
                                     )
                                     inputEos = true
                                     return false
