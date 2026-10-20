@@ -36,6 +36,7 @@ import com.example.ui.components.SectionHeader
 import com.example.ui.components.SpeedBadge
 import com.example.ui.components.formatDuration
 import com.example.ui.components.formatFileSize
+import com.example.ui.components.rememberBackgroundTaskStarter
 
 @Composable
 fun SpeedConverterScreen(
@@ -50,15 +51,22 @@ fun SpeedConverterScreen(
     val targetFormat by viewModel.targetLocalFormat.collectAsState()
     val targetBitrate by viewModel.targetLocalBitrate.collectAsState()
     val conversionState by viewModel.conversionState.collectAsState()
+    val backgroundWorkPaused by viewModel.backgroundWorkPaused.collectAsState()
 
     var showGuideDialog by remember { mutableStateOf(false) }
+    val startBackgroundConversion = rememberBackgroundTaskStarter(
+        onStart = viewModel::startLocalConversion,
+        onNotificationDenied = {
+            viewModel.showActionMessage("لم يُسمح بالإشعارات؛ سيعمل التحويل لكن قد لا يظهر إشعاره في درج الإشعارات.")
+        }
+    )
 
     if (showGuideDialog) {
         FeaturePhoneGuideDialog(onDismiss = { showGuideDialog = false })
     }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri != null) {
             viewModel.onLocalFileSelected(uri)
@@ -178,14 +186,14 @@ fun SpeedConverterScreen(
                                 }
                             }
 
-                            IconButton(onClick = { filePickerLauncher.launch("*/*") }) {
+                            IconButton(onClick = { filePickerLauncher.launch(arrayOf("*/*")) }) {
                                 Icon(Icons.Default.Edit, contentDescription = "تغيير الملف", tint = MaterialTheme.colorScheme.primary)
                             }
                         }
                     }
                 } else {
                     OutlinedButton(
-                        onClick = { filePickerLauncher.launch("*/*") },
+                        onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(52.dp)
@@ -424,7 +432,7 @@ fun SpeedConverterScreen(
                     }
 
                     Button(
-                        onClick = { viewModel.startLocalConversion() },
+                        onClick = startBackgroundConversion,
                         modifier = Modifier
                             .weight(1f)
                             .testTag("start_conversion_button"),
@@ -465,6 +473,30 @@ fun SpeedConverterScreen(
                                 .clip(RoundedCornerShape(4.dp)),
                             color = MaterialTheme.colorScheme.primary
                         )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        OutlinedButton(
+                            onClick = {
+                                if (backgroundWorkPaused) viewModel.resumeBackgroundWork()
+                                else viewModel.pauseBackgroundWork()
+                            },
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                        ) {
+                            Icon(
+                                if (backgroundWorkPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                contentDescription = null
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(if (backgroundWorkPaused) "استئناف التحويل" else "إيقاف مؤقت")
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { viewModel.cancelBackgroundWork() },
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("إلغاء التحويل في الخلفية")
+                        }
                     }
                 }
             }

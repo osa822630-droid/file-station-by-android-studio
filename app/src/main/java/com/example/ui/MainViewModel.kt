@@ -4,9 +4,20 @@ import android.app.Application
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import androidx.work.workDataOf
 import com.example.audio.AudioPlayerController
 import com.example.audio.AudioTranscoder
 import com.example.audio.VideoTranscoder
+import com.example.background.BackgroundMediaTaskStore
+import com.example.background.DownloadRequest
+import com.example.background.PersistentMediaWorker
+import com.example.background.StoredMediaTask
 import com.example.data.MediaItemRepository
 import com.example.downloader.DirectDownloadMetadataResolver
 import com.example.downloader.DownloadFilePlan
@@ -23,9 +34,12 @@ import com.example.model.ProcessingState
 import com.example.model.VideoQuality
 import com.example.ui.screens.SearchEngine
 import com.example.ui.screens.SearchResultItem
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
@@ -61,6 +75,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val downloader = MediaDownloader(application, transcoder)
     val repository = MediaItemRepository(application)
     val player = AudioPlayerController(application)
+    private val workManager = WorkManager.getInstance(application)
+    private var enqueueInProgress = false
+    private val _backgroundWorkPaused = MutableStateFlow(false)
+    val backgroundWorkPaused = _backgroundWorkPaused.asStateFlow()
 
     private val httpClient = OkHttpClient()
 
@@ -98,6 +116,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // Local file speed changer & converter state
     private val _selectedLocalUri = MutableStateFlow<Uri?>(null)
     val selectedLocalUri = _selectedLocalUri.asStateFlow()
+    private val _selectedUriPersistable = MutableStateFlow(false)
 
     private val _selectedLocalMetadata = MutableStateFlow<MediaItem?>(null)
     val selectedLocalMetadata = _selectedLocalMetadata.asStateFlow()
@@ -129,6 +148,361 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         repository.storageError.value?.let { _actionMessage.value = it }
+        observePersistentWork()
+    }
+
+    @Synchronized
+    private fun reserveBackgroundEnqueue(): Boolean {
+        if (enqueueInProgress) return false
+        enqueueInProgress = true
+        return true
+    }
+
+    @Synchronized
+    private fun releaseBackgroundEnqueue() {
+        enqueueInProgress = false
+    }
+
+    private suspend fun hasNoActiveBackgroundWork(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            workManager.getWorkInfosByTag(PersistentMediaWorker.TAG).get().none { info ->
+                val taskFile = info.taggedValue(PersistentMediaWorker.TAG_TASK_FILE_PREFIX)?.let { File(it) }
+                !info.state.isFinished ||
+                    (info.state == WorkInfo.State.CANCELLED && taskFile != null && BackgroundMediaTaskStore.isPaused(taskFile))
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun WorkInfo.taggedValue(prefix: String): String? =
+        tags.firstOrNull { it.startsWith(prefix) }?.removePrefix(prefix)
+
+    private fun buildPersistentWorkRequest(
+        descriptor: File,
+        task: StoredMediaTask,
+        isResume: Boolean = false
+    ) = run {
+        val workCreatedAt = if (isResume) System.currentTimeMillis() else task.createdAt
+        val builder = OneTimeWorkRequestBuilder<PersistentMediaWorker>()
+        if (task is StoredMediaTask.DownloadBatch) {
+            builder.setConstraints(
+                Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .build()
+            )
+        }
+        builder.setInputData(
+            workDataOf(
+                PersistentMediaWorker.KEY_TASK_FILE to descriptor.absolutePath,
+                PersistentMediaWorker.KEY_TASK_TYPE to when (task) {
+                    is StoredMediaTask.DownloadBatch -> PersistentMediaWorker.TYPE_DOWNLOADS
+                    is StoredMediaTask.LocalConversion -> PersistentMediaWorker.TYPE_LOCAL
+                },
+                PersistentMediaWorker.KEY_TASK_TITLE to task.title,
+                PersistentMediaWorker.KEY_TASK_CREATED_AT to workCreatedAt,
+                PersistentMediaWorker.KEY_TOTAL_COUNT to if (task is StoredMediaTask.DownloadBatch) task.requests.size else 1,
+                PersistentMediaWorker.KEY_SPEED to task.speed,
+                PersistentMediaWorker.KEY_RESUME to isResume
+            )
+        ).addTag(PersistentMediaWorker.TAG)
+            .addTag("${PersistentMediaWorker.TAG_TYPE_PREFIX}${if (task is StoredMediaTask.DownloadBatch) PersistentMediaWorker.TYPE_DOWNLOADS else PersistentMediaWorker.TYPE_LOCAL}")
+            .addTag("${PersistentMediaWorker.TAG_TITLE_PREFIX}${task.title.take(180)}")
+            .addTag("${PersistentMediaWorker.TAG_CREATED_AT_PREFIX}$workCreatedAt")
+            .addTag("${PersistentMediaWorker.TAG_TOTAL_COUNT_PREFIX}${if (task is StoredMediaTask.DownloadBatch) task.requests.size else 1}")
+            .addTag("${PersistentMediaWorker.TAG_SPEED_PREFIX}${task.speed}")
+            .addTag("${PersistentMediaWorker.TAG_TASK_FILE_PREFIX}${descriptor.absolutePath}")
+            .build()
+    }
+
+    private fun observePersistentWork() {
+        viewModelScope.launch {
+            workManager.getWorkInfosByTagFlow(PersistentMediaWorker.TAG).collect { workInfos ->
+                cleanupCompletedWork(workInfos)
+                val activeWork = workInfos
+                    .filterNot { it.state.isFinished }
+                    .minByOrNull {
+                        it.taggedValue(PersistentMediaWorker.TAG_CREATED_AT_PREFIX)?.toLongOrNull() ?: Long.MAX_VALUE
+                    }
+                val workInfo = activeWork ?: workInfos.maxByOrNull {
+                    it.taggedValue(PersistentMediaWorker.TAG_CREATED_AT_PREFIX)?.toLongOrNull() ?: 0L
+                } ?: return@collect
+                renderPersistentWork(workInfo)
+            }
+        }
+    }
+
+    private suspend fun cleanupCompletedWork(workInfos: List<WorkInfo>) = withContext(Dispatchers.IO) {
+        workInfos.filter { it.state == WorkInfo.State.SUCCEEDED }.forEach { info ->
+            val path = info.taggedValue(PersistentMediaWorker.TAG_TASK_FILE_PREFIX) ?: return@forEach
+            val taskFile = File(path)
+            if (taskFile.exists()) {
+                val task = runCatching { BackgroundMediaTaskStore.read(taskFile) }.getOrNull()
+                BackgroundMediaTaskStore.delete(taskFile, task)
+            }
+        }
+    }
+
+    private suspend fun renderPersistentWork(workInfo: WorkInfo) {
+        val type = workInfo.taggedValue(PersistentMediaWorker.TAG_TYPE_PREFIX).orEmpty()
+        val title = workInfo.taggedValue(PersistentMediaWorker.TAG_TITLE_PREFIX) ?: "مهمة وسائط"
+        val inputCount = workInfo.taggedValue(PersistentMediaWorker.TAG_TOTAL_COUNT_PREFIX)?.toIntOrNull() ?: 1
+        val speed = workInfo.taggedValue(PersistentMediaWorker.TAG_SPEED_PREFIX)?.toFloatOrNull() ?: 1f
+        val progress = workInfo.progress.getFloat(PersistentMediaWorker.KEY_PROGRESS, 0f).coerceIn(0f, 1f)
+        val itemTitle = workInfo.progress.getString(PersistentMediaWorker.KEY_ITEM_TITLE) ?: title
+        val stage = workInfo.progress.getString(PersistentMediaWorker.KEY_STAGE) ?: "في قائمة انتظار المهام الخلفية…"
+
+        when (workInfo.state) {
+            WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED, WorkInfo.State.RUNNING -> {
+                _backgroundWorkPaused.value = false
+                if (type == PersistentMediaWorker.TYPE_LOCAL) {
+                    _conversionState.value = ProcessingState.Processing(progress, stage)
+                } else {
+                    val index = workInfo.progress.getInt(PersistentMediaWorker.KEY_CURRENT_INDEX, 1)
+                    val total = workInfo.progress.getInt(PersistentMediaWorker.KEY_TOTAL_COUNT, inputCount)
+                    val kind = workInfo.progress.getString(PersistentMediaWorker.KEY_PROGRESS_KIND)
+                    _downloadState.value = if (kind == PersistentMediaWorker.PROGRESS_PROCESSING) {
+                        DownloadState.ProcessingSpeed(
+                            itemTitle = itemTitle,
+                            progress = progress,
+                            speed = speed
+                        )
+                    } else {
+                        DownloadState.Downloading(
+                            currentItemTitle = itemTitle,
+                            currentIndex = index.coerceAtLeast(1),
+                            totalCount = total.coerceAtLeast(1),
+                            progress = progress,
+                            bytesDownloaded = workInfo.progress.getLong(PersistentMediaWorker.KEY_BYTES_DOWNLOADED, 0L),
+                            totalBytes = workInfo.progress.getLong(PersistentMediaWorker.KEY_TOTAL_BYTES, 0L)
+                        )
+                    }
+                }
+            }
+            WorkInfo.State.SUCCEEDED -> {
+                _backgroundWorkPaused.value = false
+                val message = workInfo.outputData.getString(PersistentMediaWorker.KEY_RESULT_MESSAGE).orEmpty()
+                if (type == PersistentMediaWorker.TYPE_LOCAL) {
+                    repository.refreshFromDisk()
+                    val itemId = workInfo.outputData.getString(PersistentMediaWorker.KEY_RESULT_ITEM_ID)
+                    val item = repository.itemsFlow.value.firstOrNull { it.id == itemId }
+                    _conversionState.value = if (item != null) ProcessingState.Success(item, message)
+                    else ProcessingState.Error("اكتمل التحويل لكن تعذر استعادة عنصر المكتبة.")
+                    _actionMessage.value = message
+                } else {
+                    repository.refreshFromDisk()
+                    val completedIds = workInfo.outputData.getStringArray(PersistentMediaWorker.KEY_RESULT_COMPLETED_IDS)
+                        ?.toSet().orEmpty()
+                    val completedItems = repository.itemsFlow.value.filter { it.id in completedIds }
+                    val failedCount = workInfo.outputData.getInt(PersistentMediaWorker.KEY_RESULT_FAILED_COUNT, 0)
+                    _downloadState.value = if (completedItems.isEmpty()) DownloadState.Error(message)
+                    else DownloadState.Completed(completedItems, failedCount)
+                    _actionMessage.value = message
+                }
+            }
+            WorkInfo.State.FAILED -> {
+                _backgroundWorkPaused.value = false
+                val message = workInfo.outputData.getString(PersistentMediaWorker.KEY_RESULT_MESSAGE)
+                    ?: "فشلت المهمة الخلفية."
+                if (type == PersistentMediaWorker.TYPE_LOCAL) _conversionState.value = ProcessingState.Error(message)
+                else _downloadState.value = DownloadState.Error(message)
+                _actionMessage.value = message
+            }
+            WorkInfo.State.CANCELLED -> {
+                val taskPath = workInfo.taggedValue(PersistentMediaWorker.TAG_TASK_FILE_PREFIX)
+                val paused = taskPath != null && withContext(Dispatchers.IO) {
+                    BackgroundMediaTaskStore.isPaused(File(taskPath))
+                }
+                _backgroundWorkPaused.value = paused
+                if (paused) {
+                    if (type == PersistentMediaWorker.TYPE_LOCAL) {
+                        _conversionState.value = ProcessingState.Processing(
+                            progress,
+                            "المهمة متوقفة مؤقتًا. اضغط استئناف لمتابعة التحويل."
+                        )
+                    } else {
+                        _downloadState.value = DownloadState.Downloading(
+                            currentItemTitle = itemTitle,
+                            currentIndex = workInfo.progress.getInt(PersistentMediaWorker.KEY_CURRENT_INDEX, 1).coerceAtLeast(1),
+                            totalCount = workInfo.progress.getInt(PersistentMediaWorker.KEY_TOTAL_COUNT, inputCount).coerceAtLeast(1),
+                            progress = progress,
+                            bytesDownloaded = workInfo.progress.getLong(PersistentMediaWorker.KEY_BYTES_DOWNLOADED, 0L),
+                            totalBytes = workInfo.progress.getLong(PersistentMediaWorker.KEY_TOTAL_BYTES, 0L)
+                        )
+                    }
+                    _actionMessage.value = "أُوقفت المهمة مؤقتًا. العناصر المكتملة محفوظة؛ قد يُعاد العنصر الجاري من بدايته عند الاستئناف."
+                } else {
+                    _backgroundWorkPaused.value = false
+                    if (taskPath != null) {
+                        withContext(Dispatchers.IO) {
+                            val taskFile = File(taskPath)
+                            val task = runCatching { BackgroundMediaTaskStore.read(taskFile) }.getOrNull()
+                            val hasSavedLocalOutput = task is StoredMediaTask.LocalConversion &&
+                                repository.itemsFlow.value.any { it.id == task.id && File(it.filePath).isFile }
+                            BackgroundMediaTaskStore.delete(
+                                taskFile,
+                                task,
+                                deleteOutput = task is StoredMediaTask.LocalConversion && !hasSavedLocalOutput
+                            )
+                        }
+                    }
+                    if (type == PersistentMediaWorker.TYPE_LOCAL) _conversionState.value = ProcessingState.Idle
+                    else _downloadState.value = DownloadState.Idle
+                    _actionMessage.value = "تم إلغاء المهمة الخلفية."
+                }
+            }
+            else -> Unit
+        }
+    }
+
+    fun pauseBackgroundWork() {
+        if (!reserveBackgroundEnqueue()) {
+            _actionMessage.value = "تجري عملية أخرى على المهمة؛ انتظر لحظة ثم أعد المحاولة."
+            return
+        }
+        viewModelScope.launch {
+            val markedFiles = mutableListOf<File>()
+            try {
+                val activeInfos = withContext(Dispatchers.IO) {
+                    workManager.getWorkInfosByTag(PersistentMediaWorker.TAG).get()
+                        .filterNot { it.state.isFinished }
+                }
+                if (activeInfos.isEmpty()) {
+                    _actionMessage.value = "لا توجد مهمة قيد التشغيل لإيقافها مؤقتًا."
+                    return@launch
+                }
+                withContext(Dispatchers.IO) {
+                    activeInfos.forEach { info ->
+                        info.taggedValue(PersistentMediaWorker.TAG_TASK_FILE_PREFIX)?.let { path ->
+                            val taskFile = File(path)
+                            BackgroundMediaTaskStore.markPaused(taskFile)
+                            markedFiles += taskFile
+                        }
+                    }
+                }
+                check(markedFiles.isNotEmpty()) { "تعذر العثور على سجل المهمة لإيقافها مؤقتًا." }
+                val cancellation = workManager.cancelAllWorkByTag(PersistentMediaWorker.TAG)
+                val stoppedInfos = withContext(Dispatchers.IO) {
+                    cancellation.result.get()
+                    workManager.getWorkInfosByTagFlow(PersistentMediaWorker.TAG).first { infos ->
+                        infos.none { !it.state.isFinished }
+                    }
+                    workManager.getWorkInfosByTag(PersistentMediaWorker.TAG).get()
+                }
+                val actuallyPaused = stoppedInfos.any { info ->
+                    info.state == WorkInfo.State.CANCELLED &&
+                        info.taggedValue(PersistentMediaWorker.TAG_TASK_FILE_PREFIX)
+                            ?.let { BackgroundMediaTaskStore.isPaused(File(it)) } == true
+                }
+                _backgroundWorkPaused.value = actuallyPaused
+                _actionMessage.value = if (actuallyPaused) {
+                    "أُوقفت المهمة مؤقتًا. العناصر المكتملة محفوظة؛ قد يُعاد العنصر الجاري من بدايته عند الاستئناف."
+                } else {
+                    "اكتملت المهمة قبل تنفيذ الإيقاف المؤقت."
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                withContext(Dispatchers.IO) { markedFiles.forEach { BackgroundMediaTaskStore.clearPaused(it) } }
+                _backgroundWorkPaused.value = false
+                _actionMessage.value = "تعذر إيقاف المهمة مؤقتًا: ${error.localizedMessage ?: "خطأ غير معروف"}"
+            } finally {
+                releaseBackgroundEnqueue()
+            }
+        }
+    }
+
+    fun resumeBackgroundWork() {
+        if (!reserveBackgroundEnqueue()) {
+            _actionMessage.value = "تجري عملية أخرى على المهمة؛ انتظر لحظة ثم أعد المحاولة."
+            return
+        }
+        viewModelScope.launch {
+            try {
+                val pausedInfo = withContext(Dispatchers.IO) {
+                    workManager.getWorkInfosByTag(PersistentMediaWorker.TAG).get()
+                        .filter { info ->
+                            info.state == WorkInfo.State.CANCELLED &&
+                                info.taggedValue(PersistentMediaWorker.TAG_TASK_FILE_PREFIX)
+                                    ?.let { BackgroundMediaTaskStore.isPaused(File(it)) } == true
+                        }
+                        .maxByOrNull {
+                            it.taggedValue(PersistentMediaWorker.TAG_CREATED_AT_PREFIX)?.toLongOrNull() ?: 0L
+                        }
+                } ?: run {
+                    _backgroundWorkPaused.value = false
+                    _actionMessage.value = "لا توجد مهمة متوقفة مؤقتًا لاستئنافها."
+                    return@launch
+                }
+                val hasRunningWork = withContext(Dispatchers.IO) {
+                    workManager.getWorkInfosByTag(PersistentMediaWorker.TAG).get()
+                        .any { !it.state.isFinished }
+                }
+                if (hasRunningWork) {
+                    _actionMessage.value = "هناك مهمة أخرى تعمل بالفعل؛ لا يمكن استئناف المهمة الآن."
+                    return@launch
+                }
+                val taskPath = pausedInfo.taggedValue(PersistentMediaWorker.TAG_TASK_FILE_PREFIX)
+                    ?: throw IllegalStateException("تعذر العثور على ملف المهمة المحفوظة.")
+                val taskFile = File(taskPath)
+                val task = withContext(Dispatchers.IO) { BackgroundMediaTaskStore.read(taskFile) }
+                val workRequest = buildPersistentWorkRequest(taskFile, task, isResume = true)
+                val operation = workManager.beginUniqueWork(
+                    PersistentMediaWorker.UNIQUE_WORK_NAME,
+                    ExistingWorkPolicy.KEEP,
+                    workRequest
+                ).enqueue()
+                withContext(Dispatchers.IO) { operation.result.get() }
+                _backgroundWorkPaused.value = false
+                _actionMessage.value = if (task is StoredMediaTask.DownloadBatch) {
+                    "استؤنف التحميل؛ ستُحفظ العناصر المكتملة، وقد يُعاد تنزيل العنصر الجاري من بدايته."
+                } else {
+                    "استؤنف التحويل. سيُعاد التحويل الجاري من بدايته، مع بقاء الملف المصدر محفوظًا."
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                _backgroundWorkPaused.value = true
+                _actionMessage.value = "تعذر استئناف المهمة: ${error.localizedMessage ?: "خطأ غير معروف"}"
+            } finally {
+                releaseBackgroundEnqueue()
+            }
+        }
+    }
+
+    fun cancelBackgroundWork() {
+        _downloadState.value = DownloadState.Idle
+        _conversionState.value = ProcessingState.Idle
+        _backgroundWorkPaused.value = false
+        _actionMessage.value = "جارٍ إلغاء المهمة وتنظيف الملفات المؤقتة…"
+        viewModelScope.launch(Dispatchers.IO) {
+            val infos = runCatching { workManager.getWorkInfosByTag(PersistentMediaWorker.TAG).get() }
+                .getOrDefault(emptyList())
+            infos.forEach { info ->
+                info.taggedValue(PersistentMediaWorker.TAG_TASK_FILE_PREFIX)?.let { path ->
+                    BackgroundMediaTaskStore.clearPaused(File(path))
+                }
+            }
+            val cancellation = workManager.cancelAllWorkByTag(PersistentMediaWorker.TAG)
+            runCatching { cancellation.result.get() }
+            val stoppedInfos = runCatching {
+                workManager.getWorkInfosByTagFlow(PersistentMediaWorker.TAG).first { workInfos ->
+                    workInfos.none { !it.state.isFinished }
+                }
+            }.getOrDefault(emptyList())
+            stoppedInfos.filter { it.state == WorkInfo.State.CANCELLED }.forEach { info ->
+                val path = info.taggedValue(PersistentMediaWorker.TAG_TASK_FILE_PREFIX) ?: return@forEach
+                val taskFile = File(path)
+                val task = runCatching { BackgroundMediaTaskStore.read(taskFile) }.getOrNull()
+                val hasSavedLocalOutput = task is StoredMediaTask.LocalConversion &&
+                    repository.itemsFlow.value.any { it.id == task.id && File(it.filePath).isFile }
+                BackgroundMediaTaskStore.delete(
+                    taskFile = taskFile,
+                    task = task,
+                    deleteOutput = task is StoredMediaTask.LocalConversion && !hasSavedLocalOutput
+                )
+            }
+        }
     }
 
     fun updateDownloadUrl(url: String) {
@@ -355,78 +729,73 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         quality: VideoQuality,
         bitrate: AudioBitrate
     ) {
+        if (requests.isEmpty()) return
+        if (!reserveBackgroundEnqueue()) {
+            _actionMessage.value = "جارٍ تجهيز مهمة خلفية أخرى؛ انتظر لحظة ثم أعد المحاولة."
+            return
+        }
         viewModelScope.launch {
-            val downloadedList = mutableListOf<MediaItem>()
-            var failedCount = 0
-            var resourceLimitFailure: String? = null
-            var storageFailure: String? = null
-            val total = requests.size
-
-            for ((index, request) in requests.withIndex()) {
-                val item = request.item
-                _downloadState.value = DownloadState.Downloading(
-                    currentItemTitle = item.title,
-                    currentIndex = index + 1,
-                    totalCount = total,
-                    progress = 0.05f,
-                    bytesDownloaded = 0,
-                    totalBytes = 0
-                )
-
-                val result = downloader.downloadAndProcessItem(
-                    item = item,
-                    targetFormat = format,
-                    targetSpeed = speed,
-                    targetQuality = quality,
-                    targetBitrate = bitrate,
-                    duplicateAction = request.duplicateAction,
-                    outputFileName = request.filePlan.outputFileNameFor(request.duplicateAction),
-                    onDownloadProgress = { progress, downloaded, totalBytes ->
-                        _downloadState.value = DownloadState.Downloading(
-                            currentItemTitle = item.title,
-                            currentIndex = index + 1,
-                            totalCount = total,
-                            progress = progress * 0.7f,
-                            bytesDownloaded = downloaded,
-                            totalBytes = totalBytes
-                        )
-                    },
-                    onSpeedProgress = { speedProgress, stage ->
-                        if (stage.startsWith("توقف التحويل بأمان:")) resourceLimitFailure = stage
-                        _downloadState.value = DownloadState.ProcessingSpeed(
-                            itemTitle = item.title,
-                            progress = 0.7f + speedProgress * 0.3f,
-                            speed = speed
-                        )
-                    }
-                )
-
-                if (result != null) {
-                    if (repository.addItem(result)) {
-                        downloadedList.add(result)
-                    } else {
-                        failedCount++
-                        storageFailure = repository.storageError.value
-                            ?: "تعذر حفظ الملف في سجل المكتبة."
-                    }
-                } else {
-                    failedCount++
+            try {
+                if (!hasNoActiveBackgroundWork()) {
+                    _actionMessage.value = "هناك مهمة خلفية قيد التنفيذ بالفعل. ألغها أو انتظر اكتمالها قبل بدء مهمة أخرى."
+                    return@launch
                 }
-            }
-
-            if (downloadedList.isEmpty()) {
-                val message = storageFailure ?: resourceLimitFailure
-                    ?: "فشل تحميل جميع العناصر المحددة. لم يتم حفظ ملفات. تحقق من الرابط والاتصال ثم أعد المحاولة."
-                _downloadState.value = DownloadState.Error(message)
-                _actionMessage.value = message
-            } else {
-                _downloadState.value = DownloadState.Completed(downloadedList, failedCount)
-                _actionMessage.value = if (failedCount == 0) {
-                    "تم تحميل ${downloadedList.size} ملف بنجاح في File Station."
-                } else {
-                    val reason = (storageFailure ?: resourceLimitFailure)?.let { " $it" }.orEmpty()
-                    "تم تحميل ${downloadedList.size} ملف، وفشل تحميل $failedCount عنصر.$reason"
+                val taskId = UUID.randomUUID().toString()
+                val createdAt = System.currentTimeMillis()
+                val taskTitle = (if (requests.size == 1) requests.first().item.title else "تحميل ${requests.size} ملفات")
+                    .take(180)
+                val storedRequests = requests.mapIndexed { index, request ->
+                    DownloadRequest(
+                        item = request.item,
+                        outputFileName = request.filePlan.outputFileNameFor(request.duplicateAction),
+                        mediaItemId = UUID.nameUUIDFromBytes("$taskId:${request.item.id}:$index".toByteArray(Charsets.UTF_8)).toString()
+                    )
                 }
+                val task = StoredMediaTask.DownloadBatch(
+                    id = taskId,
+                    createdAt = createdAt,
+                    title = taskTitle,
+                    format = format,
+                    speed = speed,
+                    quality = quality,
+                    bitrate = bitrate,
+                    requests = storedRequests
+                )
+                var taskFile: File? = null
+                var enqueueSubmitted = false
+                try {
+                    val descriptor = withContext(Dispatchers.IO) {
+                        BackgroundMediaTaskStore.write(getApplication<Application>(), task)
+                    }
+                    taskFile = descriptor
+                    val workRequest = buildPersistentWorkRequest(descriptor, task)
+                    val enqueueOperation = workManager.beginUniqueWork(
+                        PersistentMediaWorker.UNIQUE_WORK_NAME,
+                        ExistingWorkPolicy.KEEP,
+                        workRequest
+                    ).enqueue()
+                    enqueueSubmitted = true
+                    withContext(Dispatchers.IO) { enqueueOperation.result.get() }
+                    _downloadState.value = DownloadState.Downloading(
+                        currentItemTitle = taskTitle,
+                        currentIndex = 1,
+                        totalCount = requests.size,
+                        progress = 0f,
+                        bytesDownloaded = 0L,
+                        totalBytes = 0L
+                    )
+                    _actionMessage.value = "بدأت المهمة؛ سيستمر التحميل والتحويل في الخلفية مع إمكانية الإلغاء."
+                } catch (cancelled: CancellationException) {
+                    if (!enqueueSubmitted) taskFile?.let { BackgroundMediaTaskStore.delete(it, task) }
+                    throw cancelled
+                } catch (error: Exception) {
+                    taskFile?.let { BackgroundMediaTaskStore.delete(it, task) }
+                    val message = "تعذر بدء المهمة الخلفية: ${error.localizedMessage ?: "خطأ غير معروف"}"
+                    _downloadState.value = DownloadState.Error(message)
+                    _actionMessage.value = message
+                }
+            } finally {
+                releaseBackgroundEnqueue()
             }
         }
     }
@@ -439,7 +808,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Local File selection: inspect metadata
      */
     fun onLocalFileSelected(uri: Uri) {
+        val resolver = getApplication<Application>().contentResolver
+        val persistedGrant = try {
+            resolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            true
+        } catch (_: Exception) {
+            resolver.persistedUriPermissions.any { permission ->
+                permission.uri == uri &&
+                    permission.isReadPermission
+            }
+        }
         _selectedLocalUri.value = uri
+        _selectedUriPersistable.value = persistedGrant
         viewModelScope.launch {
             _conversionState.value = ProcessingState.Processing(0.1f, "فحص بيانات وجودة الملف...")
             val meta = repository.inspectLocalUri(uri)
@@ -468,163 +848,110 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val quality = _targetLocalQuality.value
         val format = _targetLocalFormat.value
         val bitrate = _targetLocalBitrate.value
+        val isVideoSource = meta?.isVideo == true
+        val isVideoOutput = format in setOf(AudioFormat.MP4, AudioFormat.MKV, AudioFormat.WEBM)
+        if (isVideoOutput && !isVideoSource) {
+            _conversionState.value = ProcessingState.Error("صيغة الفيديو تتطلب مصدرًا يحتوي على مسار فيديو.")
+            return
+        }
+        if (!reserveBackgroundEnqueue()) {
+            _actionMessage.value = "جارٍ تجهيز مهمة خلفية أخرى؛ انتظر لحظة ثم أعد المحاولة."
+            return
+        }
 
         viewModelScope.launch {
-            val isVideoOutput = format == AudioFormat.MP4 || format == AudioFormat.MKV || format == AudioFormat.WEBM
-            val isVideoSource = meta?.isVideo == true
-            if (isVideoOutput && !isVideoSource) {
-                _conversionState.value = ProcessingState.Error("صيغة الفيديو تتطلب مصدرًا يحتوي على مسار فيديو.")
-                return@launch
-            }
-            _conversionState.value = ProcessingState.Processing(0.05f, "بدء تحويل الملف...")
-
-            val outputDir = File(getApplication<Application>().filesDir, "converted_audio").apply { mkdirs() }
-            val cleanTitle = (meta?.title ?: "ملف_${System.currentTimeMillis()}")
-                .replace(Regex("[^a-zA-Z0-9أ-ي_\\-\\s]"), "")
-                .trim()
-                .ifEmpty { "ملف" }
-            val videoLabel = if (isVideoOutput) "_video_${speed}x" else ""
-            val speedLabel = if (!isVideoOutput && speed != 1.0f) "_${speed}x" else ""
-            val qualityLabel = if (!isVideoOutput) "_${bitrate.label}" else ""
-            val uniqueSuffix = UUID.randomUUID().toString().take(8)
-            val outputFile = File(outputDir, "${cleanTitle}${videoLabel}${speedLabel}${qualityLabel}_$uniqueSuffix.${format.extension}")
-
-            // Copy the selected content URI to a private temporary file, then use Media3 to
-            // decode, scale and re-encode the video at the requested speed.
-            if (isVideoSource && isVideoOutput) {
-                val tempSourceFile = File(outputDir, "temp_src_${UUID.randomUUID()}")
-                val copied = try {
-                    val input = getApplication<Application>().contentResolver.openInputStream(uri)
-                        ?: throw IllegalStateException("تعذر فتح الملف المحدد")
-                    input.use { source -> tempSourceFile.outputStream().use { output -> source.copyTo(output) } }
-                    tempSourceFile.isFile && tempSourceFile.length() > 0L
-                } catch (e: Exception) {
-                    android.util.Log.e("MainViewModel", "Unable to stage selected video", e)
-                    false
-                }
-                if (!copied) {
-                    tempSourceFile.delete()
-                    _conversionState.value = ProcessingState.Error("تعذر قراءة ملف الفيديو المحدد؛ لم يُنشأ ملف ناتج.")
+            try {
+                if (!hasNoActiveBackgroundWork()) {
+                    _actionMessage.value = "هناك مهمة خلفية قيد التنفيذ بالفعل. ألغها أو انتظر اكتمالها قبل بدء مهمة أخرى."
                     return@launch
                 }
-
-                val outputInfo = try {
-                    videoTranscoder.transcodeVideo(
-                        sourceFile = tempSourceFile,
-                        outputFile = outputFile,
-                        targetQuality = quality,
-                        targetSpeed = speed,
-                        onProgress = { progress, stage ->
-                            _conversionState.value = ProcessingState.Processing(progress, stage)
-                        }
-                    )
-                } finally {
-                    tempSourceFile.delete()
-                }
-
-                if (outputInfo != null && outputFile.isFile && outputFile.length() > 0L) {
-                    val actualResolution = "${outputInfo.width} × ${outputInfo.height}"
-                    val outputDurationMs = outputInfo.durationUs / 1000L
-                    val newItem = MediaItem(
-                        id = UUID.randomUUID().toString(),
-                        title = "$cleanTitle ($actualResolution, ${speed}x)",
-                        filePath = outputFile.absolutePath,
-                        durationMs = outputDurationMs,
-                        originalDurationMs = meta?.durationMs ?: 0L,
-                        speed = speed,
-                        format = format.name,
-                        fileSize = outputFile.length(),
-                        isVideo = true,
-                        fileType = FileType.VIDEO,
-                        resolutionText = "${minOf(outputInfo.width, outputInfo.height)}p ($actualResolution)",
-                        bitrateKbps = outputInfo.bitRate.takeIf { it > 0 }?.div(1000) ?: 0,
-                        sourceUrl = uri.toString()
-                    )
-                    if (!repository.addItem(newItem)) {
-                        val message = repository.storageError.value ?: "تعذر حفظ الناتج في سجل المكتبة."
-                        _conversionState.value = ProcessingState.Error(message)
-                        _actionMessage.value = message
-                        return@launch
-                    }
-                    _conversionState.value = ProcessingState.Success(
-                        newItem,
-                        "أُعيد ترميز الفيديو فعليًا إلى ${actualResolution} بسرعة ${speed}x داخل ${format.extension.uppercase()}."
-                    )
-                    _actionMessage.value = "اكتمل تغيير الدقة/السرعة وإعادة الترميز؛ الدقة الفعلية ${actualResolution}."
-                } else {
-                    outputFile.delete()
-                    _conversionState.value = ProcessingState.Error("فشلت إعادة ترميز الفيديو. تحقق من دعم الجهاز للترميز ثم أعد المحاولة؛ لم يُحفظ ملف جزئي.")
-                }
-            } else {
-                // Audio conversion or extracting audio from video with WSOLA speed & bitrate
-                var audioOutputInfo: AudioTranscoder.AudioOutputInfo? = null
-                var resourceLimitFailure: String? = null
-                val success = transcoder.transcodeAudio(
-                    sourceUri = uri,
-                    sourceFile = null,
-                    outputFile = outputFile,
-                    targetSpeed = speed,
-                    targetFormat = format,
-                    bitrateKbps = bitrate.kbps,
-                    onProgress = { progress, stage ->
-                        if (stage.startsWith("توقف التحويل بأمان:")) resourceLimitFailure = stage
-                        _conversionState.value = ProcessingState.Processing(progress, stage)
-                    },
-                    onOutputInfo = { audioOutputInfo = it }
+                val taskId = UUID.randomUUID().toString()
+                val cleanTitle = (meta?.title ?: "ملف_${System.currentTimeMillis()}")
+                    .replace(Regex("[^a-zA-Z0-9أ-ي_\\-\\s]"), "")
+                    .trim()
+                    .ifEmpty { "ملف" }
+                val videoLabel = if (isVideoOutput) "_video_${speed}x" else ""
+                val speedLabel = if (!isVideoOutput && speed != 1.0f) "_${speed}x" else ""
+                val qualityLabel = if (!isVideoOutput) "_${bitrate.label}" else ""
+                val outputDirectory = File(getApplication<Application>().filesDir, "converted_audio")
+                val outputFile = File(
+                    outputDirectory,
+                    "${cleanTitle}${videoLabel}${speedLabel}${qualityLabel}_${taskId.take(8)}.${format.extension}"
                 )
-
-                if (success && outputFile.exists()) {
-                    val effectiveBitrateKbps = audioOutputInfo?.appliedBitrateKbps ?: bitrate.kbps
-                    val bitrateText = if (format == AudioFormat.WAV) {
-                        "$effectiveBitrateKbps kbps PCM"
+                var stagedSource: File? = null
+                var taskFile: File? = null
+                var enqueued = false
+                var enqueueSubmitted = false
+                try {
+                    var stagedSourceFile: File? = null
+                    if (!_selectedUriPersistable.value) {
+                        _conversionState.value = ProcessingState.Processing(0.02f, "نسخ المصدر لتأمين استمرار التحويل…")
+                        stagedSourceFile = BackgroundMediaTaskStore.stageLocalSource(
+                            context = getApplication<Application>(),
+                            uri = uri,
+                            taskId = taskId,
+                            onProgress = { copied, total ->
+                                val progress = if (total > 0L) (copied.toFloat() / total).coerceIn(0f, 1f) else 0f
+                                _conversionState.value = ProcessingState.Processing(
+                                    0.02f + progress * 0.08f,
+                                    "حفظ المصدر لاستمرار التحويل في الخلفية…"
+                                )
+                            }
+                        )
+                        stagedSource = stagedSourceFile
                     } else {
-                        "$effectiveBitrateKbps kbps"
+                        _conversionState.value = ProcessingState.Processing(0.08f, "تحضير وصول آمن للمصدر…")
                     }
-                    val adjustmentDetails = audioOutputInfo?.let { info ->
-                        buildList {
-                            if (info.requestWasAdjusted) {
-                                add("المطلوب ${info.requestedBitrateKbps} kbps، والمطبق ${info.appliedBitrateKbps} kbps")
-                            }
-                            if (info.sampleRate != info.sourceSampleRate || info.channels != info.sourceChannels) {
-                                add("تهيأت العينة إلى ${info.sampleRate} Hz / ${info.channels} قناة")
-                            }
-                        }
-                    }.orEmpty()
-                    val adjustmentText = if (adjustmentDetails.isEmpty()) "" else " (${adjustmentDetails.joinToString("؛ ")})"
-                    val finalDuration = if (meta != null && meta.durationMs > 0 && speed > 0) {
-                        (meta.durationMs / speed).toLong()
-                    } else 0L
-
-                    val newItem = MediaItem(
-                        id = UUID.randomUUID().toString(),
-                        title = "${cleanTitle} (${speed}x, $bitrateText)",
-                        filePath = outputFile.absolutePath,
-                        durationMs = finalDuration,
+                    val createdAt = System.currentTimeMillis()
+                    val taskTitle = cleanTitle.take(180)
+                    val task = StoredMediaTask.LocalConversion(
+                        id = taskId,
+                        createdAt = createdAt,
+                        title = taskTitle,
+                        sourcePath = stagedSourceFile?.absolutePath.orEmpty(),
+                        sourceUri = uri.toString(),
+                        outputPath = outputFile.absolutePath,
                         originalDurationMs = meta?.durationMs ?: 0L,
+                        isVideoSource = isVideoSource,
                         speed = speed,
-                        format = format.name,
-                        fileSize = outputFile.length(),
-                        isVideo = false,
-                        fileType = FileType.AUDIO,
-                        bitrateKbps = effectiveBitrateKbps,
-                        sourceUrl = uri.toString()
+                        format = format,
+                        quality = quality,
+                        bitrate = bitrate
                     )
-                    if (!repository.addItem(newItem)) {
-                        val message = repository.storageError.value ?: "تعذر حفظ الناتج في سجل المكتبة."
-                        _conversionState.value = ProcessingState.Error(message)
-                        _actionMessage.value = message
-                        return@launch
+                    val descriptor = withContext(Dispatchers.IO) {
+                        BackgroundMediaTaskStore.write(getApplication<Application>(), task)
                     }
-                    _conversionState.value = ProcessingState.Success(
-                        newItem,
-                        "تم استخراج وتحويل الصوت بنجاح بصيغة ${format.name} بمعدل $bitrateText$adjustmentText!"
-                    )
-                    _actionMessage.value = "تم تحويل الملف بنجاح! جاهز للاستماع والمشاركة."
-                } else {
-                    _conversionState.value = ProcessingState.Error(
-                        resourceLimitFailure ?: "فشلت عملية التحويل. يرجى تجربة ملف آخر."
-                    )
+                    taskFile = descriptor
+                    val workRequest = buildPersistentWorkRequest(descriptor, task)
+                    val enqueueOperation = workManager.beginUniqueWork(
+                        PersistentMediaWorker.UNIQUE_WORK_NAME,
+                        ExistingWorkPolicy.KEEP,
+                        workRequest
+                    ).enqueue()
+                    enqueueSubmitted = true
+                    withContext(Dispatchers.IO) { enqueueOperation.result.get() }
+                    enqueued = true
+                    _conversionState.value = ProcessingState.Processing(0.1f, "أُضيف التحويل إلى المهام الخلفية؛ يمكنك إغلاق التطبيق بأمان.")
+                    _actionMessage.value = "بدأ التحويل في الخلفية. سيظهر إشعار مستمر ويمكنك إلغاء المهمة منه أو من التطبيق."
+                } catch (cancelled: CancellationException) {
+                    if (!enqueueSubmitted) {
+                        taskFile?.let { BackgroundMediaTaskStore.delete(it, null) }
+                        stagedSource?.delete()
+                        outputFile.delete()
+                    }
+                    throw cancelled
+                } catch (error: Exception) {
+                    if (!enqueued) {
+                        taskFile?.let { BackgroundMediaTaskStore.delete(it, null) }
+                        stagedSource?.delete()
+                        outputFile.delete()
+                    }
+                    val message = "تعذر بدء التحويل في الخلفية: ${error.localizedMessage ?: "خطأ غير معروف"}"
+                    _conversionState.value = ProcessingState.Error(message)
+                    _actionMessage.value = message
                 }
+            } finally {
+                releaseBackgroundEnqueue()
             }
         }
     }

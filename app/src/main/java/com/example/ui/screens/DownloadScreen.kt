@@ -39,6 +39,7 @@ import com.example.model.VideoQuality
 import com.example.ui.MainViewModel
 import com.example.ui.components.FeaturePhoneGuideDialog
 import com.example.ui.components.SectionHeader
+import com.example.ui.components.rememberBackgroundTaskStarter
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -52,12 +53,19 @@ fun DownloadScreen(
 
     val downloadUrl by viewModel.downloadUrl.collectAsState()
     val downloadState by viewModel.downloadState.collectAsState()
+    val backgroundWorkPaused by viewModel.backgroundWorkPaused.collectAsState()
     val targetFormat by viewModel.targetDownloadFormat.collectAsState()
     val targetSpeed by viewModel.targetDownloadSpeed.collectAsState()
     val targetQuality by viewModel.targetDownloadQuality.collectAsState()
     val targetBitrate by viewModel.targetDownloadBitrate.collectAsState()
 
     var showGuideDialog by remember { mutableStateOf(false) }
+    val startBackgroundDownload = rememberBackgroundTaskStarter(
+        onStart = viewModel::startDownload,
+        onNotificationDenied = {
+            viewModel.showActionMessage("لم يُسمح بالإشعارات؛ ستعمل المهمة لكن قد لا يظهر إشعارها في درج الإشعارات.")
+        }
+    )
 
     if (showGuideDialog) {
         FeaturePhoneGuideDialog(onDismiss = { showGuideDialog = false })
@@ -534,7 +542,7 @@ fun DownloadScreen(
 
                 item {
                     Button(
-                        onClick = { viewModel.startDownload() },
+                        onClick = startBackgroundDownload,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(54.dp)
@@ -565,7 +573,11 @@ fun DownloadScreen(
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             Text(
-                                text = "جاري التحميل: [${state.currentIndex}/${state.totalCount}]",
+                                text = if (backgroundWorkPaused) {
+                                    "متوقف مؤقتًا: [${state.currentIndex}/${state.totalCount}]"
+                                } else {
+                                    "جاري التحميل: [${state.currentIndex}/${state.totalCount}]"
+                                },
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold
                             )
@@ -593,6 +605,30 @@ fun DownloadScreen(
                                 style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.Bold
                             )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            OutlinedButton(
+                                onClick = {
+                                    if (backgroundWorkPaused) viewModel.resumeBackgroundWork()
+                                    else viewModel.pauseBackgroundWork()
+                                },
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                            ) {
+                                Icon(
+                                    if (backgroundWorkPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                    contentDescription = null
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(if (backgroundWorkPaused) "استئناف المهمة" else "إيقاف مؤقت")
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = { viewModel.cancelBackgroundWork() },
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = null)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("إلغاء المهمة الخلفية")
+                            }
                         }
                     }
                 }
@@ -610,7 +646,8 @@ fun DownloadScreen(
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             Text(
-                                text = "تطبيق السرعة والترميز (${state.speed}x)",
+                                text = if (backgroundWorkPaused) "المعالجة متوقفة مؤقتًا (${state.speed}x)"
+                                else "تطبيق السرعة والترميز (${state.speed}x)",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.primary
@@ -636,6 +673,30 @@ fun DownloadScreen(
                                 text = "معالجة النبرة والترميز: ${(state.progress * 100).toInt()}%",
                                 style = MaterialTheme.typography.labelMedium
                             )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            OutlinedButton(
+                                onClick = {
+                                    if (backgroundWorkPaused) viewModel.resumeBackgroundWork()
+                                    else viewModel.pauseBackgroundWork()
+                                },
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                            ) {
+                                Icon(
+                                    if (backgroundWorkPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                    contentDescription = null
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(if (backgroundWorkPaused) "استئناف المهمة" else "إيقاف مؤقت")
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = { viewModel.cancelBackgroundWork() },
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = null)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("إلغاء المهمة الخلفية")
+                            }
                         }
                     }
                 }

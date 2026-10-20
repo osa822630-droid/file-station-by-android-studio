@@ -11,7 +11,12 @@ import com.example.model.FileType
 import com.example.model.MediaItem
 import com.example.model.PlaylistItem
 import com.example.model.VideoQuality
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.InternalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -393,6 +398,7 @@ class MediaDownloader(
      * Downloads any media/file from any link, applies speed/format processing,
      * and handles duplicate conflicts.
      */
+    @OptIn(InternalCoroutinesApi::class)
     suspend fun downloadAndProcessItem(
         item: PlaylistItem,
         targetFormat: AudioFormat,
@@ -404,6 +410,7 @@ class MediaDownloader(
         onDownloadProgress: (progress: Float, downloaded: Long, total: Long) -> Unit,
         onSpeedProgress: (progress: Float, stage: String) -> Unit
     ): MediaItem? = withContext(Dispatchers.IO) {
+        val coroutineJob = currentCoroutineContext()[Job]
         if (duplicateAction == DuplicateAction.CANCEL) {
             return@withContext null
         }
@@ -491,7 +498,15 @@ class MediaDownloader(
                         .url(streamUrl)
                         .header("User-Agent", userAgent)
                         .build()
-                    httpClient.newCall(req).execute().use { resp ->
+                    val call = httpClient.newCall(req)
+                    val cancellationHandle = coroutineJob?.invokeOnCompletion(
+                        onCancelling = true,
+                        invokeImmediately = true
+                    ) { cause ->
+                        if (cause is CancellationException) call.cancel()
+                    }
+                    try {
+                        call.execute().use { resp ->
                         val body = resp.body
                         if (resp.isSuccessful && body != null) {
                             val totalBytes = body.contentLength()
@@ -499,6 +514,7 @@ class MediaDownloader(
                                 val prefixBuffer = ByteArray(1024)
                                 var prefixSize = 0
                                 while (prefixSize < prefixBuffer.size) {
+                                    coroutineJob?.ensureActive()
                                     val read = input.read(prefixBuffer, prefixSize, prefixBuffer.size - prefixSize)
                                     if (read <= 0) break
                                     prefixSize += read
@@ -539,6 +555,7 @@ class MediaDownloader(
                                             val buffer = ByteArray(16_384)
                                             var read: Int
                                             while (input.read(buffer).also { read = it } != -1) {
+                                                coroutineJob?.ensureActive()
                                                 output.write(buffer, 0, read)
                                                 bytesCopied += read
                                                 if (totalBytes > 0) {
@@ -562,8 +579,14 @@ class MediaDownloader(
                             downloadSuccessful = downloadMetadata != null &&
                                 tempDownloadFile.isFile && tempDownloadFile.length() > 0L
                         }
+                        }
+                    } finally {
+                        cancellationHandle?.dispose()
                     }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (e: Exception) {
+                    coroutineJob?.ensureActive()
                     e.printStackTrace()
                 }
             }
@@ -698,6 +721,7 @@ class MediaDownloader(
                 }
             }
 
+            coroutineJob?.ensureActive()
             if (targetOutputFile != requestedOutputFile &&
                 !publishStagedOutput(targetOutputFile, requestedOutputFile)) {
                 targetOutputFile.delete()
@@ -735,6 +759,10 @@ class MediaDownloader(
                     else if (isOriginalFormat) sourceBitrateKbps ?: 0 else targetBitrate.kbps,
                 sourceUrl = item.url
             )
+        } catch (cancelled: CancellationException) {
+            if (tempDownloadFile.exists()) tempDownloadFile.delete()
+            targetOutputFile.delete()
+            throw cancelled
         } catch (e: Exception) {
             e.printStackTrace()
             if (tempDownloadFile.exists()) tempDownloadFile.delete()
@@ -746,28 +774,49 @@ class MediaDownloader(
     /**
      * Resolves YouTube direct stream URL from public proxies
      */
+    @OptIn(InternalCoroutinesApi::class)
     private suspend fun resolveYouTubeStreamUrl(videoId: String): String {
         val instances = listOf(
             "https://inv.tux.pizza/api/v1/videos/$videoId",
             "https://invidious.nerdvpn.de/api/v1/videos/$videoId",
             "https://pipedapi.kavin.rocks/streams/$videoId"
         )
+        val job = currentCoroutineContext()[Job]
         for (url in instances) {
+            job?.ensureActive()
+            val call = try {
+                val request = Request.Builder().url(url).header("User-Agent", userAgent).build()
+                httpClient.newCall(request)
+            } catch (_: Exception) {
+                continue
+            }
+            val cancellationHandle = job?.invokeOnCompletion(
+                onCancelling = true,
+                invokeImmediately = true
+            ) { cause ->
+                if (cause is CancellationException) call.cancel()
+            }
             try {
-                val req = Request.Builder().url(url).header("User-Agent", userAgent).build()
-                val resp = httpClient.newCall(req).execute()
-                if (resp.isSuccessful) {
-                    val json = JSONObject(resp.body?.string() ?: "")
-                    val formatStreams = json.optJSONArray("formatStreams")
-                    if (formatStreams != null && formatStreams.length() > 0) {
-                        return formatStreams.getJSONObject(0).optString("url", "")
-                    }
-                    val audioStreams = json.optJSONArray("audioStreams")
-                    if (audioStreams != null && audioStreams.length() > 0) {
-                        return audioStreams.getJSONObject(0).optString("url", "")
+                call.execute().use { response ->
+                    if (response.isSuccessful) {
+                        val json = JSONObject(response.body?.string() ?: "")
+                        val formatStreams = json.optJSONArray("formatStreams")
+                        if (formatStreams != null && formatStreams.length() > 0) {
+                            return formatStreams.getJSONObject(0).optString("url", "")
+                        }
+                        val audioStreams = json.optJSONArray("audioStreams")
+                        if (audioStreams != null && audioStreams.length() > 0) {
+                            return audioStreams.getJSONObject(0).optString("url", "")
+                        }
                     }
                 }
-            } catch (_: Exception) {}
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                job?.ensureActive()
+            } finally {
+                cancellationHandle?.dispose()
+            }
         }
         return ""
     }

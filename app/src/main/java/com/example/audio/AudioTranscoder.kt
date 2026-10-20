@@ -9,7 +9,11 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
 import com.example.model.AudioFormat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
@@ -109,6 +113,8 @@ class AudioTranscoder(private val context: Context) {
             runCatching { outputInfo?.let(onOutputInfo) }
             runCatching { onProgress(1.0f, "تم حفظ الملف الصوتي والتحقق منه بنجاح.") }
             true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             android.util.Log.e("AudioTranscoder", "Audio transcode failed before publish", e)
             false
@@ -132,9 +138,11 @@ class AudioTranscoder(private val context: Context) {
         if (!outputFile.extension.equals(targetFormat.extension, ignoreCase = true)) return@withContext false
 
         val workingFiles = mutableListOf<File>()
+        val workerJob = currentCoroutineContext()[Job]
         try {
             onProgress(0.05f, "قراءة وفك تشفير الصوت إلى ملف مؤقت محدود الذاكرة...")
             val decoded = decodeToPcmFile(sourceUri, sourceFile) { decodeProgress ->
+                workerJob?.ensureActive()
                 onProgress(0.05f + decodeProgress * 0.35f, "فك تشفير الصوت (${(decodeProgress * 100).toInt()}%)")
             } ?: return@withContext false
             workingFiles += decoded.file
@@ -165,6 +173,7 @@ class AudioTranscoder(private val context: Context) {
                     speed = targetSpeed,
                     maxOutputSamples = maxOutputSamples
                 ) { stretchProgress ->
+                    workerJob?.ensureActive()
                     onProgress(0.40f + stretchProgress * 0.35f,
                         "معالجة سرعة الصوت (${(stretchProgress * 100).toInt()}%)")
                 }
@@ -223,6 +232,7 @@ class AudioTranscoder(private val context: Context) {
                     outputFile = outputFile,
                     bitrateKbps = appliedBitrateKbps
                 ) { encodeProgress ->
+                    workerJob?.ensureActive()
                     onProgress(0.80f + encodeProgress * 0.20f,
                         "ترميز MP3 (${(encodeProgress * 100).toInt()}%)")
                 }
@@ -232,6 +242,7 @@ class AudioTranscoder(private val context: Context) {
                     outputFile = outputFile,
                     onOutputFormat = { actualAacOutput = it }
                 ) { encodeProgress ->
+                    workerJob?.ensureActive()
                     val visibleProgress = encodeProgress.coerceAtMost(0.99f)
                     onProgress(0.80f + visibleProgress * 0.20f,
                         "ترميز AAC داخل M4A (${(visibleProgress * 100).toInt()}%)")
@@ -262,6 +273,8 @@ class AudioTranscoder(private val context: Context) {
             onProgress(0.99f, message)
             android.util.Log.w("AudioTranscoder", message)
             false
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             android.util.Log.e("AudioTranscoder", "Audio transcode failed before publish", e)
             onProgress(0.99f, "فشل تحويل الصوت؛ لم يُنشر ملف جزئي.")
@@ -533,6 +546,8 @@ class AudioTranscoder(private val context: Context) {
             }
         } catch (e: PcmResourceLimitException) {
             throw e
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             android.util.Log.w("AudioTranscoder", "Unable to decode audio to PCM file", e)
             return null
@@ -714,6 +729,8 @@ class AudioTranscoder(private val context: Context) {
             }
             success = outputFile.isFile && outputFile.length() > 64L && containsMpegLayer3Frame(outputFile)
             return success
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             android.util.Log.e("AudioTranscoder", "MP3 file-stream encoding failed", e)
             return false
@@ -930,6 +947,8 @@ class AudioTranscoder(private val context: Context) {
             android.system.Os.rename(stagedFile.absolutePath, outputFile.absolutePath)
             success = outputFile.isFile && outputFile.length() > 0L
             return success
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             android.util.Log.e("AudioTranscoder", "AAC file-stream encoding failed", e)
             return false

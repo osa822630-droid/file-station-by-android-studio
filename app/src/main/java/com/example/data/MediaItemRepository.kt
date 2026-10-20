@@ -41,6 +41,10 @@ class MediaItemRepository(
         loadPersistedItems()
     }
 
+    suspend fun refreshFromDisk() = withContext(Dispatchers.IO) {
+        mutationMutex.withLock { loadPersistedItems() }
+    }
+
     private fun loadPersistedItems() {
         val backupFile = File(storageFile.path + ".bak")
         if (!storageFile.exists() && !backupFile.exists()) return
