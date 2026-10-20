@@ -127,6 +127,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _actionMessage = MutableStateFlow<String?>(null)
     val actionMessage = _actionMessage.asStateFlow()
 
+    init {
+        repository.storageError.value?.let { _actionMessage.value = it }
+    }
+
     fun updateDownloadUrl(url: String) {
         _downloadUrl.value = url
     }
@@ -355,6 +359,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val downloadedList = mutableListOf<MediaItem>()
             var failedCount = 0
             var resourceLimitFailure: String? = null
+            var storageFailure: String? = null
             val total = requests.size
 
             for ((index, request) in requests.withIndex()) {
@@ -397,15 +402,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
 
                 if (result != null) {
-                    repository.addItem(result)
-                    downloadedList.add(result)
+                    if (repository.addItem(result)) {
+                        downloadedList.add(result)
+                    } else {
+                        failedCount++
+                        storageFailure = repository.storageError.value
+                            ?: "تعذر حفظ الملف في سجل المكتبة."
+                    }
                 } else {
                     failedCount++
                 }
             }
 
             if (downloadedList.isEmpty()) {
-                val message = resourceLimitFailure
+                val message = storageFailure ?: resourceLimitFailure
                     ?: "فشل تحميل جميع العناصر المحددة. لم يتم حفظ ملفات. تحقق من الرابط والاتصال ثم أعد المحاولة."
                 _downloadState.value = DownloadState.Error(message)
                 _actionMessage.value = message
@@ -414,7 +424,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _actionMessage.value = if (failedCount == 0) {
                     "تم تحميل ${downloadedList.size} ملف بنجاح في File Station."
                 } else {
-                    val reason = resourceLimitFailure?.let { " $it" }.orEmpty()
+                    val reason = (storageFailure ?: resourceLimitFailure)?.let { " $it" }.orEmpty()
                     "تم تحميل ${downloadedList.size} ملف، وفشل تحميل $failedCount عنصر.$reason"
                 }
             }
@@ -530,7 +540,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         bitrateKbps = outputInfo.bitRate.takeIf { it > 0 }?.div(1000) ?: 0,
                         sourceUrl = uri.toString()
                     )
-                    repository.addItem(newItem)
+                    if (!repository.addItem(newItem)) {
+                        val message = repository.storageError.value ?: "تعذر حفظ الناتج في سجل المكتبة."
+                        _conversionState.value = ProcessingState.Error(message)
+                        _actionMessage.value = message
+                        return@launch
+                    }
                     _conversionState.value = ProcessingState.Success(
                         newItem,
                         "أُعيد ترميز الفيديو فعليًا إلى ${actualResolution} بسرعة ${speed}x داخل ${format.extension.uppercase()}."
@@ -594,7 +609,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         bitrateKbps = effectiveBitrateKbps,
                         sourceUrl = uri.toString()
                     )
-                    repository.addItem(newItem)
+                    if (!repository.addItem(newItem)) {
+                        val message = repository.storageError.value ?: "تعذر حفظ الناتج في سجل المكتبة."
+                        _conversionState.value = ProcessingState.Error(message)
+                        _actionMessage.value = message
+                        return@launch
+                    }
                     _conversionState.value = ProcessingState.Success(
                         newItem,
                         "تم استخراج وتحويل الصوت بنجاح بصيغة ${format.name} بمعدل $bitrateText$adjustmentText!"
@@ -770,8 +790,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun deleteItem(item: MediaItem) {
         viewModelScope.launch {
-            repository.deleteItem(item)
-            _actionMessage.value = "تم حذف الملف"
+            val deleted = repository.deleteItem(item)
+            _actionMessage.value = if (deleted) "تم حذف الملف" else {
+                repository.storageError.value ?: "تعذر حفظ تغييرات سجل المكتبة."
+            }
         }
     }
 

@@ -9,12 +9,15 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.webkit.MimeTypeMap
+import android.util.AtomicFile
 import androidx.core.content.FileProvider
 import com.example.model.FileType
 import com.example.model.MediaItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -22,23 +25,28 @@ import java.io.File
 import java.io.FileInputStream
 import java.util.UUID
 
-class MediaItemRepository(private val context: Context) {
+class MediaItemRepository(
+    private val context: Context,
+    private val storageFile: File = File(context.filesDir, "media_library.json")
+) {
 
-    private val storageFile = File(context.filesDir, "media_library.json")
+    private val atomicStorageFile = AtomicFile(storageFile)
+    private val mutationMutex = Mutex()
     private val _itemsFlow = MutableStateFlow<List<MediaItem>>(emptyList())
     val itemsFlow = _itemsFlow.asStateFlow()
+    private val _storageError = MutableStateFlow<String?>(null)
+    val storageError = _storageError.asStateFlow()
 
     init {
         loadPersistedItems()
     }
 
     private fun loadPersistedItems() {
+        val backupFile = File(storageFile.path + ".bak")
+        if (!storageFile.exists() && !backupFile.exists()) return
+
         try {
-            if (!storageFile.exists()) {
-                _itemsFlow.value = emptyList()
-                return
-            }
-            val content = storageFile.readText()
+            val content = atomicStorageFile.openRead().bufferedReader().use { it.readText() }
             val array = JSONArray(content)
             val list = mutableListOf<MediaItem>()
             for (i in 0 until array.length()) {
@@ -54,7 +62,6 @@ class MediaItemRepository(private val context: Context) {
                     } catch (_: Exception) {
                         FileType.AUDIO
                     }
-
                     list.add(
                         MediaItem(
                             id = obj.getString("id"),
@@ -76,57 +83,89 @@ class MediaItemRepository(private val context: Context) {
                 }
             }
             _itemsFlow.value = list
+            _storageError.value = null
         } catch (e: Exception) {
-            e.printStackTrace()
-            _itemsFlow.value = emptyList()
+            android.util.Log.e("MediaItemRepository", "Unable to read persisted library; keeping current in-memory state", e)
+            _storageError.value = STORAGE_READ_ERROR
         }
     }
 
-    private fun savePersistedItems() {
-        try {
-            val array = JSONArray()
-            for (item in _itemsFlow.value) {
-                val obj = JSONObject().apply {
-                    put("id", item.id)
-                    put("title", item.title)
-                    put("filePath", item.filePath)
-                    put("durationMs", item.durationMs)
-                    put("originalDurationMs", item.originalDurationMs)
-                    put("speed", item.speed.toDouble())
-                    put("format", item.format)
-                    put("fileSize", item.fileSize)
-                    put("isVideo", item.isVideo)
-                    put("fileType", item.fileType.name)
-                    put("resolutionText", item.resolutionText)
-                    put("bitrateKbps", item.bitrateKbps)
-                    put("dateAdded", item.dateAdded)
-                    put("sourceUrl", item.sourceUrl)
-                }
-                array.put(obj)
+    private fun savePersistedItems(items: List<MediaItem>) {
+        val array = JSONArray()
+        for (item in items) {
+            val obj = JSONObject().apply {
+                put("id", item.id)
+                put("title", item.title)
+                put("filePath", item.filePath)
+                put("durationMs", item.durationMs)
+                put("originalDurationMs", item.originalDurationMs)
+                put("speed", item.speed.toDouble())
+                put("format", item.format)
+                put("fileSize", item.fileSize)
+                put("isVideo", item.isVideo)
+                put("fileType", item.fileType.name)
+                put("resolutionText", item.resolutionText)
+                put("bitrateKbps", item.bitrateKbps)
+                put("dateAdded", item.dateAdded)
+                put("sourceUrl", item.sourceUrl)
             }
-            storageFile.writeText(array.toString())
+            array.put(obj)
+        }
+        val bytes = array.toString().toByteArray(Charsets.UTF_8)
+        val output = atomicStorageFile.startWrite()
+        try {
+            output.write(bytes)
+            output.fd.sync()
+            atomicStorageFile.finishWrite(output)
         } catch (e: Exception) {
-            e.printStackTrace()
+            atomicStorageFile.failWrite(output)
+            throw e
         }
     }
 
-    suspend fun addItem(item: MediaItem) = withContext(Dispatchers.IO) {
-        val current = _itemsFlow.value.toMutableList()
-        current.removeAll { it.id == item.id || it.filePath == item.filePath }
-        current.add(0, item)
-        _itemsFlow.value = current
-        savePersistedItems()
+    suspend fun addItem(item: MediaItem): Boolean = withContext(Dispatchers.IO) {
+        mutationMutex.withLock {
+            val updated = _itemsFlow.value.toMutableList().apply {
+                removeAll { it.id == item.id || it.filePath == item.filePath }
+                add(0, item)
+            }
+            try {
+                savePersistedItems(updated)
+                _itemsFlow.value = updated
+                _storageError.value = null
+                true
+            } catch (e: Exception) {
+                android.util.Log.e("MediaItemRepository", "Unable to persist library addition", e)
+                _storageError.value = STORAGE_WRITE_ERROR
+                false
+            }
+        }
     }
 
-    suspend fun deleteItem(item: MediaItem) = withContext(Dispatchers.IO) {
-        val file = File(item.filePath)
-        if (file.exists()) {
-            file.delete()
+    suspend fun deleteItem(item: MediaItem): Boolean = withContext(Dispatchers.IO) {
+        mutationMutex.withLock {
+            val updated = _itemsFlow.value.filterNot { it.id == item.id }
+            try {
+                savePersistedItems(updated)
+                _itemsFlow.value = updated
+                _storageError.value = null
+            } catch (e: Exception) {
+                android.util.Log.e("MediaItemRepository", "Unable to persist library deletion", e)
+                _storageError.value = STORAGE_WRITE_ERROR
+                return@withLock false
+            }
+
+            val file = File(item.filePath)
+            if (file.exists() && !file.delete()) {
+                android.util.Log.w("MediaItemRepository", "Removed library entry but could not delete its media file")
+            }
+            true
         }
-        val current = _itemsFlow.value.toMutableList()
-        current.removeAll { it.id == item.id }
-        _itemsFlow.value = current
-        savePersistedItems()
+    }
+
+    private companion object {
+        const val STORAGE_READ_ERROR = "تعذر قراءة سجل المكتبة؛ احتُفظ بملف السجل ولم تُمسح القائمة الحالية."
+        const val STORAGE_WRITE_ERROR = "تعذر حفظ سجل المكتبة؛ لم تُطبّق التغييرات على القائمة الحالية."
     }
 
     /**
