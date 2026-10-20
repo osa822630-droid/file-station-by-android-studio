@@ -99,6 +99,7 @@ class MediaDownloader(
         var author = "YouTube"
         var durationSeconds = 0L
         var resolvedStreamUrl = ""
+        var resolvedStreamMimeType = ""
 
         // 1. Try public Piped / Invidious API for accurate duration and direct stream links
         val invidiousEndpoints = listOf(
@@ -126,7 +127,9 @@ class MediaDownloader(
                     // Check format streams
                     val formatStreams = json.optJSONArray("formatStreams")
                     if (formatStreams != null && formatStreams.length() > 0) {
-                        resolvedStreamUrl = formatStreams.getJSONObject(0).optString("url", "")
+                        val firstStream = formatStreams.getJSONObject(0)
+                        resolvedStreamUrl = firstStream.optString("url", "")
+                        resolvedStreamMimeType = firstStream.optString("mimeType", "")
                     }
                     if (durationSeconds > 0) break
                 }
@@ -195,7 +198,8 @@ class MediaDownloader(
             isSelected = true,
             isVideo = true,
             fileType = FileType.VIDEO,
-            directStreamUrl = resolvedStreamUrl
+            directStreamUrl = resolvedStreamUrl,
+            sourceMimeType = resolvedStreamMimeType
         )
     }
 
@@ -203,88 +207,88 @@ class MediaDownloader(
      * Inspects direct download links or general websites for any file type
      */
     private suspend fun parseDirectOrWebLink(url: String): PlaylistItem {
-        var fileName = "ملف_تم_تنزيله"
-        var fileType = FileType.OTHER
         var contentLength = 0L
-        var isVideo = false
+        var metadata = DirectDownloadMetadataResolver.fromHeaders(
+            contentTypeHeader = null,
+            contentDisposition = null,
+            url = url
+        )
 
         try {
-            // First HEAD request to inspect headers without downloading whole body
             val headReq = Request.Builder()
                 .url(url)
                 .header("User-Agent", userAgent)
                 .head()
                 .build()
-
-            val resp = try { httpClient.newCall(headReq).execute() } catch (_: Exception) { null }
-
-            val contentType = resp?.header("Content-Type")?.lowercase() ?: ""
-            val contentDisposition = resp?.header("Content-Disposition") ?: ""
-            contentLength = resp?.header("Content-Length")?.toLongOrNull() ?: 0L
-
-            // Extract file name from Content-Disposition if present
-            if (contentDisposition.isNotEmpty()) {
-                val nameMatcher = Pattern.compile("filename\\*?=['\"]?(?:UTF-8'')?([^;'\"]+)").matcher(contentDisposition)
-                if (nameMatcher.find()) {
-                    val raw = nameMatcher.group(1) ?: ""
-                    fileName = try { URLDecoder.decode(raw, "UTF-8") } catch (_: Exception) { raw }
+            httpClient.newCall(headReq).execute().use { response ->
+                if (response.isSuccessful) {
+                    val contentType = response.header("Content-Type")
+                    val disposition = response.header("Content-Disposition")
+                    contentLength = response.header("Content-Length")?.toLongOrNull()?.coerceAtLeast(0L) ?: 0L
+                    metadata = DirectDownloadMetadataResolver.fromHeaders(
+                        contentTypeHeader = contentType,
+                        contentDisposition = disposition,
+                        url = response.request.url.toString()
+                    )
                 }
             }
-
-            if (fileName == "ملف_تم_تنزيله") {
-                // Infer from URL path
-                val pathSegment = url.substringBefore('?').substringAfterLast('/')
-                if (pathSegment.isNotEmpty() && pathSegment.contains('.')) {
-                    fileName = try { URLDecoder.decode(pathSegment, "UTF-8") } catch (_: Exception) { pathSegment }
-                }
-            }
-
-            // Determine file type
-            val ext = fileName.substringAfterLast('.', "").lowercase()
-            when {
-                contentType.startsWith("video/") || ext in listOf("mp4", "mkv", "webm", "avi", "mov", "3gp") -> {
-                    fileType = FileType.VIDEO
-                    isVideo = true
-                }
-                contentType.startsWith("audio/") || ext in listOf("mp3", "m4a", "wav", "aac", "flac", "ogg") -> {
-                    fileType = FileType.AUDIO
-                    isVideo = false
-                }
-                contentType == "application/pdf" || ext == "pdf" -> {
-                    fileType = FileType.DOCUMENT
-                }
-                contentType.contains("android.package-archive") || ext == "apk" -> {
-                    fileType = FileType.APK
-                }
-                contentType.contains("zip") || contentType.contains("compressed") || ext in listOf("zip", "rar", "7z", "tar", "gz") -> {
-                    fileType = FileType.ARCHIVE
-                }
-                contentType.startsWith("image/") || ext in listOf("jpg", "jpeg", "png", "webp", "gif") -> {
-                    fileType = FileType.IMAGE
-                }
-                else -> {
-                    fileType = FileType.OTHER
-                }
-            }
-
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (_: Exception) {
+            // HEAD may be unsupported. The GET response is validated before any output is saved.
         }
 
-        val cleanTitle = fileName.substringBeforeLast('.').ifEmpty { "ملف من رابط خارجي" }
+        // Some hosts suppress filenames and report only application/octet-stream on HEAD.
+        // A one-byte range probe can still reveal the real Content-Type/Content-Disposition
+        // needed to plan an original-format destination before conflict handling.
+        val isKnownWebPayload = metadata.mimeType == "text/html" ||
+            metadata.mimeType == "application/xhtml+xml" ||
+            metadata.mimeType == "application/json" || metadata.mimeType == "text/json" ||
+            metadata.mimeType.endsWith("+json")
+        if (metadata.extension == "bin" && !isKnownWebPayload) {
+            try {
+                val probeRequest = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", userAgent)
+                    .header("Range", "bytes=0-0")
+                    .get()
+                    .build()
+                httpClient.newCall(probeRequest).execute().use { response ->
+                    if (response.isSuccessful) {
+                        metadata = DirectDownloadMetadataResolver.fromHeaders(
+                            contentTypeHeader = response.header("Content-Type"),
+                            contentDisposition = response.header("Content-Disposition"),
+                            url = response.request.url.toString(),
+                            fallbackFileName = metadata.fileName
+                        )
+                        val rangeTotal = response.header("Content-Range")
+                            ?.substringAfterLast('/')?.toLongOrNull()
+                        val fullResponseLength = if (response.code == 206) null else {
+                            response.header("Content-Length")?.toLongOrNull()?.coerceAtLeast(0L)
+                        }
+                        contentLength = rangeTotal ?: fullResponseLength ?: contentLength
+                    }
+                }
+            } catch (_: Exception) {
+                // Keep the conservative `.bin` fallback; the actual GET is still validated.
+            }
+        }
 
+        val cleanTitle = metadata.fileName.substringBeforeLast('.')
+            .ifEmpty { "ملف من رابط خارجي" }
+        val isVideo = metadata.fileType == FileType.VIDEO
         return PlaylistItem(
             id = UUID.randomUUID().toString(),
             title = cleanTitle,
             author = "رابط مباشر / موقع خارجي",
-            durationText = if (isVideo || fileType == FileType.AUDIO) "جاري القياس" else "--:--",
+            durationText = if (metadata.fileType == FileType.VIDEO || metadata.fileType == FileType.AUDIO) "جاري القياس" else "--:--",
             durationSeconds = 0,
             thumbnailUrl = "",
             url = url,
             isSelected = true,
             isVideo = isVideo,
-            fileType = fileType,
-            fileSizeEstimate = contentLength
+            fileType = metadata.fileType,
+            fileSizeEstimate = contentLength,
+            sourceMimeType = metadata.mimeType,
+            sourceFileName = metadata.fileName
         )
     }
 
@@ -407,15 +411,30 @@ class MediaDownloader(
         val downloadsDir = File(context.filesDir, "audio_downloads").apply { mkdirs() }
         val cleanTitle = item.title.replace(Regex("[^a-zA-Z0-9أ-ي_\\-\\s]"), "").trim().ifEmpty { "ملف_${System.currentTimeMillis()}" }
 
-        // Video containers cannot be produced by the audio-copy path. Refuse an audio
-        // source selected for a video extension rather than relabeling its bytes.
+        val isOriginalFormat = targetFormat == AudioFormat.ORIGINAL
         val requestsVideoContainer = targetFormat == AudioFormat.MP4 ||
             targetFormat == AudioFormat.MKV || targetFormat == AudioFormat.WEBM
-        if (requestsVideoContainer && !item.isVideo) return@withContext null
-        val isVideoDownload = item.isVideo && requestsVideoContainer
-        val speedTag = if (kotlin.math.abs(targetSpeed - 1.0f) > 0.01f) "_${targetSpeed}x" else ""
-        val qualityTag = if (isVideoDownload) "_${targetQuality.height}p" else ""
-        val outputExt = targetFormat.extension
+        val requestsAudioContainer = targetFormat == AudioFormat.MP3 ||
+            targetFormat == AudioFormat.M4A || targetFormat == AudioFormat.WAV
+        // Reject known source/target mismatches early. Unknown direct links are checked against
+        // the actual GET response before the file is copied or transcoded.
+        if (!isOriginalFormat && requestsVideoContainer && item.fileType == FileType.AUDIO) {
+            return@withContext null
+        }
+        if (!isOriginalFormat && requestsAudioContainer &&
+            item.fileType !in setOf(FileType.AUDIO, FileType.VIDEO, FileType.OTHER)) {
+            return@withContext null
+        }
+        val speedTag = if (!isOriginalFormat && kotlin.math.abs(targetSpeed - 1.0f) > 0.01f) "_${targetSpeed}x" else ""
+        val qualityTag = if (!isOriginalFormat && requestsVideoContainer) "_${targetQuality.height}p" else ""
+        val outputExt = if (isOriginalFormat) {
+            DirectDownloadMetadataResolver.extensionFrom(
+                contentTypeHeader = item.sourceMimeType,
+                fileName = item.sourceFileName,
+                url = item.directStreamUrl.ifEmpty { item.url }
+            )
+        } else targetFormat.extension
+        if (outputExt.isBlank()) return@withContext null
         val baseFileName = "$cleanTitle$qualityTag$speedTag"
         val plannedFileName = outputFileName?.let { name ->
             name.takeIf { File(it).name == it && it.endsWith(".$outputExt", ignoreCase = true) }
@@ -457,13 +476,15 @@ class MediaDownloader(
             }
 
             var downloadSuccessful = false
+            var downloadMetadata: DirectDownloadMetadata? = null
             var originalDurationMs = item.durationSeconds * 1000L
             var finalDurationMs = originalDurationMs
             var finalResolution = ""
             var sourceBitrateKbps: Int? = null
             var finalVideoInfo: VideoTranscoder.VideoInfo? = null
 
-            // Attempt real streaming download
+            // Download only a successful, non-empty response whose headers and leading bytes
+            // identify a real file. This prevents HTML/JSON error pages from masquerading as media.
             if (streamUrl.isNotEmpty() && !isYouTubeVideoUrl(streamUrl)) {
                 try {
                     val req = Request.Builder()
@@ -474,23 +495,72 @@ class MediaDownloader(
                         val body = resp.body
                         if (resp.isSuccessful && body != null) {
                             val totalBytes = body.contentLength()
-                            var bytesCopied = 0L
+                            body.byteStream().buffered().use { input ->
+                                val prefixBuffer = ByteArray(1024)
+                                var prefixSize = 0
+                                while (prefixSize < prefixBuffer.size) {
+                                    val read = input.read(prefixBuffer, prefixSize, prefixBuffer.size - prefixSize)
+                                    if (read <= 0) break
+                                    prefixSize += read
+                                }
 
-                            body.byteStream().use { input ->
-                                FileOutputStream(tempDownloadFile).use { output ->
-                                    val buffer = ByteArray(16384)
-                                    var read: Int
-                                    while (input.read(buffer).also { read = it } != -1) {
-                                        output.write(buffer, 0, read)
-                                        bytesCopied += read
-                                        if (totalBytes > 0) {
-                                            onDownloadProgress(bytesCopied.toFloat() / totalBytes, bytesCopied, totalBytes)
+                                if (prefixSize > 0) {
+                                    val metadata = DirectDownloadMetadataResolver.validateResponse(
+                                        statusCode = resp.code,
+                                        contentTypeHeader = resp.header("Content-Type"),
+                                        contentDisposition = resp.header("Content-Disposition"),
+                                        responseUrl = resp.request.url.toString(),
+                                        fallbackFileName = item.sourceFileName,
+                                        prefix = prefixBuffer.copyOf(prefixSize)
+                                    )
+                                    val actualSourceType = metadata?.fileType
+                                        ?.takeIf { it != FileType.OTHER } ?: item.fileType
+                                    val targetMatchesSource = when {
+                                        metadata == null -> false
+                                        isOriginalFormat -> metadata.extension.equals(outputExt, ignoreCase = true)
+                                        requestsVideoContainer -> actualSourceType == FileType.VIDEO
+                                        requestsAudioContainer -> actualSourceType == FileType.AUDIO ||
+                                            actualSourceType == FileType.VIDEO
+                                        else -> false
+                                    }
+
+                                    if (metadata != null && targetMatchesSource) {
+                                        downloadMetadata = metadata.copy(fileType = actualSourceType)
+                                        FileOutputStream(tempDownloadFile).use { output ->
+                                            output.write(prefixBuffer, 0, prefixSize)
+                                            var bytesCopied = prefixSize.toLong()
+                                            if (totalBytes > 0) {
+                                                onDownloadProgress(
+                                                    (bytesCopied.toFloat() / totalBytes).coerceIn(0f, 1f),
+                                                    bytesCopied,
+                                                    totalBytes
+                                                )
+                                            }
+                                            val buffer = ByteArray(16_384)
+                                            var read: Int
+                                            while (input.read(buffer).also { read = it } != -1) {
+                                                output.write(buffer, 0, read)
+                                                bytesCopied += read
+                                                if (totalBytes > 0) {
+                                                    onDownloadProgress(
+                                                        (bytesCopied.toFloat() / totalBytes).coerceIn(0f, 1f),
+                                                        bytesCopied,
+                                                        totalBytes
+                                                    )
+                                                }
+                                            }
                                         }
+                                    } else {
+                                        onSpeedProgress(
+                                            0.02f,
+                                            if (metadata == null) "رُفضت استجابة HTML/JSON أو ملف غير صالح."
+                                            else "نوع الملف أو امتداده لا يطابق الخيار المحدد."
+                                        )
                                     }
                                 }
                             }
-
-                            downloadSuccessful = tempDownloadFile.exists() && tempDownloadFile.length() > 0L
+                            downloadSuccessful = downloadMetadata != null &&
+                                tempDownloadFile.isFile && tempDownloadFile.length() > 0L
                         }
                     }
                 } catch (e: Exception) {
@@ -501,12 +571,16 @@ class MediaDownloader(
             // Never substitute generated content for a failed download.
             if (!downloadSuccessful) {
                 tempDownloadFile.delete()
+                if (targetOutputFile != requestedOutputFile) targetOutputFile.delete()
                 return@withContext null
             }
+            val actualSourceType = downloadMetadata?.fileType ?: item.fileType
+            val isVideoDownload = actualSourceType == FileType.VIDEO &&
+                (requestsVideoContainer || isOriginalFormat)
 
-            // Inspect downloaded file metadata (real duration, resolution)
+            // Inspect downloaded media metadata when available; non-media originals are allowed.
+            val retriever = MediaMetadataRetriever()
             try {
-                val retriever = MediaMetadataRetriever()
                 retriever.setDataSource(tempDownloadFile.absolutePath)
                 val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 val parsedDur = durStr?.toLongOrNull() ?: 0L
@@ -523,10 +597,13 @@ class MediaDownloader(
                 }
                 sourceBitrateKbps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
                     ?.toIntOrNull()?.takeIf { it > 0 }?.div(1000)
-                retriever.release()
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+                // Documents, archives, and images have no media metadata to extract.
+            } finally {
+                try { retriever.release() } catch (_: Exception) {}
+            }
 
-            if (isVideoDownload) {
+            if (isVideoDownload && !isOriginalFormat) {
                 val videoInfo = videoTranscoder.inspectVideo(tempDownloadFile)
                 if (videoInfo == null) {
                     onSpeedProgress(0.1f, "تعذر التحقق من مسار الفيديو؛ أُلغي إخراج الملف.")
@@ -541,7 +618,14 @@ class MediaDownloader(
 
             // 2. Re-encode video through Android's decoder/encoder for the requested size and speed.
             var audioOutputInfo: AudioTranscoder.AudioOutputInfo? = null
-            if (isVideoDownload) {
+            if (isOriginalFormat) {
+                val moved = tempDownloadFile.renameTo(targetOutputFile)
+                if (!moved || !targetOutputFile.isFile || targetOutputFile.length() <= 0L) {
+                    tempDownloadFile.delete()
+                    targetOutputFile.delete()
+                    return@withContext null
+                }
+            } else if (isVideoDownload) {
                 if (targetFormat == AudioFormat.WEBM) {
                     val sourceInfo = videoTranscoder.inspectVideo(tempDownloadFile)
                     val requestedShortSide = sourceInfo?.let { minOf(it.width, it.height, targetQuality.height) } ?: 0
@@ -621,9 +705,18 @@ class MediaDownloader(
             }
             val finalFileLength = requestedOutputFile.length()
             if (finalFileLength <= 0L) return@withContext null
-            val effectiveDurationMs = if (isVideoDownload) finalDurationMs else if (targetSpeed > 0 && finalDurationMs > 0) {
-                (finalDurationMs / targetSpeed).toLong()
+            val effectiveSpeed = if (isOriginalFormat) 1.0f else targetSpeed
+            val effectiveDurationMs = if (isVideoDownload || effectiveSpeed == 1.0f) {
+                finalDurationMs
+            } else if (effectiveSpeed > 0 && finalDurationMs > 0) {
+                (finalDurationMs / effectiveSpeed).toLong()
             } else finalDurationMs
+            val outputFileType = when {
+                isOriginalFormat -> actualSourceType
+                isVideoDownload -> FileType.VIDEO
+                requestsAudioContainer -> FileType.AUDIO
+                else -> actualSourceType
+            }
 
             return@withContext MediaItem(
                 id = UUID.randomUUID().toString(),
@@ -631,19 +724,15 @@ class MediaDownloader(
                 filePath = requestedOutputFile.absolutePath,
                 durationMs = effectiveDurationMs,
                 originalDurationMs = originalDurationMs,
-                speed = targetSpeed,
-                format = targetFormat.name,
+                speed = effectiveSpeed,
+                format = if (isOriginalFormat) outputExt.uppercase() else targetFormat.name,
                 fileSize = finalFileLength,
-                isVideo = isVideoDownload,
-                fileType = when {
-                    isVideoDownload -> FileType.VIDEO
-                    targetFormat == AudioFormat.MP3 || targetFormat == AudioFormat.M4A ||
-                        targetFormat == AudioFormat.WAV -> FileType.AUDIO
-                    else -> item.fileType
-                },
+                isVideo = outputFileType == FileType.VIDEO,
+                fileType = outputFileType,
                 resolutionText = finalResolution,
                 bitrateKbps = audioOutputInfo?.appliedBitrateKbps
-                    ?: if (isVideoDownload) finalVideoInfo?.bitRate?.takeIf { it > 0 }?.div(1000) ?: sourceBitrateKbps ?: 0 else targetBitrate.kbps,
+                    ?: if (isVideoDownload) finalVideoInfo?.bitRate?.takeIf { it > 0 }?.div(1000) ?: sourceBitrateKbps ?: 0
+                    else if (isOriginalFormat) sourceBitrateKbps ?: 0 else targetBitrate.kbps,
                 sourceUrl = item.url
             )
         } catch (e: Exception) {

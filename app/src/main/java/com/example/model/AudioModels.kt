@@ -16,7 +16,8 @@ enum class AudioFormat(val extension: String, val mimeType: String, val label: S
     WAV("wav", "audio/wav", "WAV - صوت خام عالي النقاء"),
     MP4("mp4", "video/mp4", "MP4 - فيديو كامل عالي الجودة"),
     MKV("mkv", "video/x-matroska", "MKV - فيديو متعدد المسارات"),
-    WEBM("webm", "video/webm", "WebM - فيديو مضغوط للويب")
+    WEBM("webm", "video/webm", "WebM - فيديو مضغوط للويب"),
+    ORIGINAL("", "application/octet-stream", "الاحتفاظ بالصيغة الأصلية")
 }
 
 enum class VideoQuality(val label: String, val height: Int, val width: Int, val estimatedBitrateKbps: Int) {
@@ -55,7 +56,9 @@ data class PlaylistItem(
     val fileType: FileType = FileType.AUDIO,
     val fileSizeEstimate: Long = 0L,
     val selectedQuality: VideoQuality = VideoQuality.Q720P,
-    val directStreamUrl: String = ""
+    val directStreamUrl: String = "",
+    val sourceMimeType: String = "",
+    val sourceFileName: String = ""
 )
 
 data class MediaItem(

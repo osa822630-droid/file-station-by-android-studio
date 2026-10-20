@@ -26,6 +26,7 @@ object AudioBitratePolicy {
                     .coerceAtMost(Int.MAX_VALUE.toLong())
                     .toInt()
             }
+            AudioFormat.ORIGINAL -> null
             else -> null
         }
     }

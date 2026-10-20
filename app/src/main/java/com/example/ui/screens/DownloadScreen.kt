@@ -222,7 +222,11 @@ fun DownloadScreen(
                 Column(modifier = Modifier.padding(16.dp)) {
                     SectionHeader(
                         title = "إعدادات التنزيل والصيغة",
-                        subtitle = "تُعاد معالجة الفيديو فعليًا لتطبيق حد الدقة والسرعة المختارين.",
+                        subtitle = if (targetFormat == AudioFormat.ORIGINAL) {
+                            "يُحفظ الملف كما ورد من المصدر، دون تحويل أو تغيير امتداده."
+                        } else {
+                            "تُعاد معالجة الفيديو فعليًا لتطبيق حد الدقة والسرعة المختارين."
+                        },
                         icon = Icons.Default.Tune
                     )
 
@@ -241,6 +245,7 @@ fun DownloadScreen(
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         listOf(
+                            AudioFormat.ORIGINAL to "الصيغة الأصلية",
                             AudioFormat.MP4 to "فيديو MP4",
                             AudioFormat.MKV to "فيديو MKV",
                             AudioFormat.MP3 to "صوت MP3",
@@ -304,6 +309,13 @@ fun DownloadScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                    } else if (targetFormat == AudioFormat.ORIGINAL) {
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Text(
+                            text = "سيُحفظ PDF وAPK والصور والأرشيفات والملفات العامة بامتدادها ونوعها الفعليين. لا تُطبّق إعدادات السرعة أو الدقة أو معدل البت على النسخ الأصلي.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     } else if (targetFormat == AudioFormat.WAV) {
                         Spacer(modifier = Modifier.height(14.dp))
                         Text(
@@ -357,52 +369,54 @@ fun DownloadScreen(
                         )
                     }
 
-                    // Speed Choices (0.5x, 0.75x, 1x, 1.25x, 1.5x, 1.75x, 2x)
-                    Spacer(modifier = Modifier.height(14.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = if (isVideo) "سرعة الفيديو:" else "سرعة الصوت الناتج:",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            text = "${targetSpeed}x",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f).forEach { s ->
-                            val isSelected = targetSpeed == s
-                            FilterChip(
-                                selected = isSelected,
-                                onClick = { viewModel.setTargetDownloadSpeed(s) },
-                                enabled = true,
-                                label = { Text("${s}x") },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = MaterialTheme.colorScheme.primary,
-                                    selectedLabelColor = MaterialTheme.colorScheme.onPrimary
-                                )
+                    if (targetFormat != AudioFormat.ORIGINAL) {
+                        // Speed Choices (0.5x, 0.75x, 1x, 1.25x, 1.5x, 1.75x, 2x)
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (isVideo) "سرعة الفيديو:" else "سرعة الصوت الناتج:",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "${targetSpeed}x",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
                             )
                         }
-                    }
-                    if (isVideo) {
+
                         Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "تُعاد مزامنة الصوت والصورة عند السرعة المختارة، مع الحفاظ على نبرة الصوت قدر الإمكان.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f).forEach { s ->
+                                val isSelected = targetSpeed == s
+                                FilterChip(
+                                    selected = isSelected,
+                                    onClick = { viewModel.setTargetDownloadSpeed(s) },
+                                    enabled = true,
+                                    label = { Text("${s}x") },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = MaterialTheme.colorScheme.primary,
+                                        selectedLabelColor = MaterialTheme.colorScheme.onPrimary
+                                    )
+                                )
+                            }
+                        }
+                        if (isVideo) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "تُعاد مزامنة الصوت والصورة عند السرعة المختارة، مع الحفاظ على نبرة الصوت قدر الإمكان.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 }
             }

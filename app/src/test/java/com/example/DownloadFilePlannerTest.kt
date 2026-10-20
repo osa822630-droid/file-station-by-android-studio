@@ -65,6 +65,23 @@ class DownloadFilePlannerTest {
     }
 
     @Test
+    fun perItemExtensionsPreserveDifferentOriginalFileTypes() {
+        val plans = DownloadFilePlanner.plan(
+            titles = listOf("manual", "installer", "photo"),
+            extension = "bin",
+            suffix = "",
+            existingFileNames = setOf("installer.apk"),
+            extensions = listOf("pdf", "apk", "png")
+        )
+
+        assertEquals(listOf("manual.pdf", "installer.apk", "photo.png"), plans.map { it.targetFileName })
+        assertEquals("installer (1).apk", plans[1].downloadAnywayFileName)
+        assertTrue(plans[1].conflictsWithExistingFile)
+        assertFalse(plans[0].conflictsWithExistingFile)
+        assertFalse(plans[2].conflictsWithExistingFile)
+    }
+
+    @Test
     fun emptyTitlesAreSanitizedAndDistinct() {
         val plans = DownloadFilePlanner.plan(
             titles = listOf("💥", "💥"),

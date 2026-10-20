@@ -8,6 +8,7 @@ import com.example.audio.AudioPlayerController
 import com.example.audio.AudioTranscoder
 import com.example.audio.VideoTranscoder
 import com.example.data.MediaItemRepository
+import com.example.downloader.DirectDownloadMetadataResolver
 import com.example.downloader.DownloadFilePlan
 import com.example.downloader.DownloadFilePlanner
 import com.example.downloader.MediaDownloader
@@ -246,14 +247,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val speed = _targetDownloadSpeed.value
         val quality = _targetDownloadQuality.value
         val bitrate = _targetDownloadBitrate.value
-        val isVideoFormat = format == AudioFormat.MP4 || format == AudioFormat.MKV || format == AudioFormat.WEBM
-        val speedTag = if (kotlin.math.abs(speed - 1.0f) > 0.01f) "_${speed}x" else ""
+        val isOriginalFormat = format == AudioFormat.ORIGINAL
+        val isVideoFormat = !isOriginalFormat &&
+            (format == AudioFormat.MP4 || format == AudioFormat.MKV || format == AudioFormat.WEBM)
+        val speedTag = if (!isOriginalFormat && kotlin.math.abs(speed - 1.0f) > 0.01f) "_${speed}x" else ""
         val qualityTag = if (isVideoFormat) "_${quality.height}p" else ""
+        val plannedExtensions = if (isOriginalFormat) {
+            itemsToDownload.map { item ->
+                DirectDownloadMetadataResolver.extensionFrom(
+                    contentTypeHeader = item.sourceMimeType,
+                    fileName = item.sourceFileName,
+                    url = item.directStreamUrl.ifEmpty { item.url }
+                )
+            }
+        } else null
         val filePlans = DownloadFilePlanner.plan(
             titles = itemsToDownload.map { it.title },
-            extension = format.extension,
+            extension = format.extension.ifBlank { "bin" },
             suffix = "$qualityTag$speedTag",
-            existingFileNames = downloader.existingOutputFileNames()
+            existingFileNames = downloader.existingOutputFileNames(),
+            extensions = plannedExtensions
         )
         if (filePlans.size != itemsToDownload.size) {
             _actionMessage.value = "تعذر تجهيز أسماء ملفات التحميل."

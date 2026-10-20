@@ -1,6 +1,7 @@
 package com.example.downloader
 
 import com.example.model.DuplicateAction
+import java.util.Locale
 
 /** A collision-aware, deterministic destination plan for one selected download item. */
 data class DownloadFilePlan(
@@ -33,14 +34,18 @@ object DownloadFilePlanner {
         titles: List<String>,
         extension: String,
         suffix: String,
-        existingFileNames: Set<String>
+        existingFileNames: Set<String>,
+        extensions: List<String>? = null
     ): List<DownloadFilePlan> {
-        val normalizedExtension = extension.removePrefix(".")
-        if (normalizedExtension.isBlank()) return emptyList()
+        val normalizedExtensions = (extensions ?: List(titles.size) { extension })
+            .map { it.removePrefix(".").lowercase(Locale.ROOT) }
+        if (normalizedExtensions.size != titles.size || normalizedExtensions.any { ext ->
+                ext.isBlank() || ext.length > 12 || ext.any { !it.isLetterOrDigit() }
+            }) return emptyList()
 
-        val targetNames = mutableListOf<String>()
+        val targetNames = mutableListOf<Pair<String, String>>()
         val reservedTargetNames = mutableSetOf<String>()
-        for (title in titles) {
+        for ((title, normalizedExtension) in titles.zip(normalizedExtensions)) {
             val cleanTitle = title
                 .replace(Regex("[^a-zA-Z0-9أ-ي_\\-\\s]"), "")
                 .trim()
@@ -53,12 +58,12 @@ object DownloadFilePlanner {
                 counter++
             }
             val candidate = "$candidateBase.$normalizedExtension"
-            targetNames += candidate
+            targetNames += candidate to normalizedExtension
             reservedTargetNames += candidate
         }
 
         val reservedAnywayNames = mutableSetOf<String>()
-        return targetNames.map { targetName ->
+        return targetNames.map { (targetName, normalizedExtension) ->
             val conflicts = targetName in existingFileNames
             val anywayName = if (!conflicts) {
                 targetName

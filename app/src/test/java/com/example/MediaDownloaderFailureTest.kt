@@ -138,6 +138,94 @@ class MediaDownloaderFailureTest {
     }
 
     @Test
+    fun `html response with video suffix is rejected and never written as media`() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "text/html; charset=utf-8")
+                .setBody("<!doctype html><html><body>not found</body></html>")
+        )
+
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val title = "html-masquerading-as-video-${UUID.randomUUID()}"
+        val outputFile = File(context.filesDir, "audio_downloads/$title.mp4")
+        val item = PlaylistItem(
+            id = UUID.randomUUID().toString(),
+            title = title,
+            url = server.url("/clip.mp4").toString(),
+            fileType = FileType.VIDEO,
+            isVideo = true,
+            sourceMimeType = "video/mp4",
+            sourceFileName = "clip.mp4"
+        )
+
+        val result = MediaDownloader(context, AudioTranscoder(context)).downloadAndProcessItem(
+            item = item,
+            targetFormat = AudioFormat.MP4,
+            targetSpeed = 1.0f,
+            onDownloadProgress = { _, _, _ -> },
+            onSpeedProgress = { _, _ -> }
+        )
+
+        assertNull("An HTML page must not be accepted as a video", result)
+        assertFalse(outputFile.exists())
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test
+    fun `original format keeps a valid public PDF using range probe metadata`() = runBlocking {
+        val id = UUID.randomUUID().toString()
+        val sourceName = "manual-$id.pdf"
+        val pdfBytes = "%PDF-1.7\nOriginal test PDF bytes".toByteArray(Charsets.US_ASCII)
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/octet-stream")
+                .setHeader("Content-Length", "42")
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(206)
+                .setHeader("Content-Type", "application/pdf")
+                .setHeader("Content-Disposition", "attachment; filename=$sourceName")
+                .setHeader("Content-Range", "bytes 0-0/42")
+                .setBody("%")
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/pdf")
+                .setHeader("Content-Disposition", "attachment; filename=$sourceName")
+                .setBody(String(pdfBytes, Charsets.US_ASCII))
+        )
+
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val downloader = MediaDownloader(context, AudioTranscoder(context))
+        val inspected = downloader.inspectUrl(server.url("/download").toString())
+        val item = inspected.items.single()
+        assertEquals(FileType.DOCUMENT, item.fileType)
+        assertEquals("application/pdf", item.sourceMimeType)
+        assertEquals(sourceName, item.sourceFileName)
+
+        val downloadsDir = File(context.filesDir, "audio_downloads")
+        val outputFile = File(downloadsDir, sourceName)
+        val result = downloader.downloadAndProcessItem(
+            item = item,
+            targetFormat = AudioFormat.ORIGINAL,
+            targetSpeed = 1.0f,
+            onDownloadProgress = { _, _, _ -> },
+            onSpeedProgress = { _, _ -> }
+        )
+
+        val downloaded = result ?: throw AssertionError("The PDF should be saved without audio/video transcoding")
+        assertTrue(outputFile.isFile)
+        assertTrue(outputFile.readBytes().contentEquals(pdfBytes))
+        assertEquals(FileType.DOCUMENT, downloaded.fileType)
+        assertEquals("PDF", downloaded.format)
+        assertEquals(3, server.requestCount)
+    }
+
+    @Test
     fun `playlist extraction failure returns no invented entries`() = runBlocking {
         server.enqueue(
             MockResponse()
