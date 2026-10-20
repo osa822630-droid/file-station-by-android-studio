@@ -61,9 +61,17 @@ jobs:
             app/build/reports/lint-results-debug.html
 
   android-instrumented:
-    name: Android Instrumented tests on API 36 emulator
+    name: Android Instrumented tests on API ${{ matrix.api-level }} emulator
     runs-on: ubuntu-24.04
     needs: jvm-lint-and-package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - api-level: 29
+            profile: pixel_2
+          - api-level: 36
+            profile: pixel_7_pro
     timeout-minutes: 60
     steps:
       - name: Check out repository
@@ -96,11 +104,11 @@ jobs:
       - name: Run Android Instrumented tests
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 36
-          system-image-api-level: 36
+          api-level: ${{ matrix.api-level }}
+          system-image-api-level: ${{ matrix.api-level }}
           target: google_apis
           arch: x86_64
-          profile: pixel_7_pro
+          profile: ${{ matrix.profile }}
           cores: 2
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
           disable-animations: true
@@ -112,7 +120,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: android-instrumented-test-reports
+          name: android-instrumented-test-reports-api-${{ matrix.api-level }}
           if-no-files-found: warn
           path: |
             app/build/outputs/androidTest-results/connected/

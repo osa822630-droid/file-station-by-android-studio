@@ -126,4 +126,79 @@ class AudioTranscoderInstrumentedTest {
             roundTripOutput.delete()
         }
     }
+
+    @Test
+    fun m4aNegotiatesMonoAndAValidRateForMultichannelUnusualRatePcm() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val id = UUID.randomUUID().toString()
+        val source = File(context.cacheDir, "m4a-unusual-source-$id.wav")
+        val output = File(context.cacheDir, "m4a-unusual-output-$id.m4a")
+        val sourceSampleRate = 7_000
+        val sourceChannels = 3
+        val frames = 3_500
+        val samples = ShortArray(frames * sourceChannels) { index ->
+            val frame = index / sourceChannels
+            val channel = index % sourceChannels
+            val frequency = 220.0 + channel * 110.0
+            (sin(2.0 * PI * frequency * frame / sourceSampleRate) * 8_000).toInt().toShort()
+        }
+        val sourceRateSupported = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { codec ->
+            if (!codec.isEncoder || codec.supportedTypes.none { it.equals("audio/mp4a-latm", ignoreCase = true) }) {
+                false
+            } else {
+                runCatching {
+                    val capabilities = codec.getCapabilitiesForType("audio/mp4a-latm")
+                    val hasAacLc = capabilities.profileLevels.isEmpty() || capabilities.profileLevels.any {
+                        it.profile == MediaCodecInfo.CodecProfileLevel.AACObjectLC
+                    }
+                    val audio = capabilities.audioCapabilities
+                    hasAacLc && audio != null && audio.maxInputChannelCount >= 1 &&
+                        audio.isSampleRateSupported(sourceSampleRate)
+                }.getOrDefault(false)
+            }
+        }
+        var extractor: MediaExtractor? = null
+        var outputInfo: AudioTranscoder.AudioOutputInfo? = null
+
+        try {
+            WavHelper.writeWavFile(source, samples, sourceSampleRate, sourceChannels)
+            val success = AudioTranscoder(context).transcodeAudio(
+                sourceUri = null,
+                sourceFile = source,
+                outputFile = output,
+                targetSpeed = 1.0f,
+                targetFormat = AudioFormat.M4A,
+                bitrateKbps = 128,
+                onOutputInfo = { outputInfo = it }
+            ) { _, _ -> }
+
+            assertTrue("Multichannel PCM should be downmixed and encoded as M4A", success)
+            assertTrue(output.isFile && output.length() > 128L)
+            val actualOutputInfo = outputInfo ?: throw AssertionError("AAC output metadata should be reported")
+            assertEquals(sourceChannels, actualOutputInfo.sourceChannels)
+            assertEquals(1, actualOutputInfo.channels)
+            assertTrue(actualOutputInfo.sampleRate > 0)
+            if (!sourceRateSupported) {
+                assertTrue(
+                    "An AAC encoder that rejects 7 kHz input must report the negotiated resampled rate",
+                    actualOutputInfo.sampleRate != sourceSampleRate
+                )
+            }
+
+            extractor = MediaExtractor()
+            extractor.setDataSource(output.absolutePath)
+            val audioTrack = (0 until extractor.trackCount)
+                .map { extractor.getTrackFormat(it) }
+                .firstOrNull { (it.getString(MediaFormat.KEY_MIME) ?: "").startsWith("audio/") }
+                ?: throw AssertionError("M4A should contain an audio track")
+            assertEquals("audio/mp4a-latm", audioTrack.getString(MediaFormat.KEY_MIME))
+            assertEquals(audioTrack.getInteger(MediaFormat.KEY_SAMPLE_RATE), actualOutputInfo.sampleRate)
+            assertEquals(audioTrack.getInteger(MediaFormat.KEY_CHANNEL_COUNT), actualOutputInfo.channels)
+        } finally {
+            try { extractor?.release() } catch (_: Exception) {}
+            source.delete()
+            output.delete()
+        }
+    }
+
 }
