@@ -1,12 +1,15 @@
 package com.example.data
 
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
+import android.provider.MediaStore
+import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
-import com.example.model.AudioFormat
 import com.example.model.FileType
 import com.example.model.MediaItem
 import kotlinx.coroutines.Dispatchers
@@ -17,7 +20,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.util.UUID
 
 class MediaItemRepository(private val context: Context) {
@@ -260,26 +262,99 @@ class MediaItemRepository(private val context: Context) {
         }
     }
 
-    /**
-     * Exports file to public external Downloads folder for easy USB / SD Card transfer
-     */
+    /** Publishes a file to Downloads using scoped storage on Android 10 and newer. */
     suspend fun exportToPublicDownloads(item: MediaItem): Boolean = withContext(Dispatchers.IO) {
-        val sourceFile = File(item.filePath)
-        if (!sourceFile.exists()) return@withContext false
-
-        try {
-            val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            val destFile = File(publicDir, sourceFile.name)
-
-            FileInputStream(sourceFile).use { input ->
-                FileOutputStream(destFile).use { output ->
-                    input.copyTo(output)
-                }
-            }
-            return@withContext true
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return@withContext false
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            false
+        } else {
+            exportToMediaStoreDownloads(item)
         }
     }
+
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.Q)
+    private fun exportToMediaStoreDownloads(item: MediaItem): Boolean {
+        val sourceFile = File(item.filePath)
+        if (!sourceFile.isFile) return false
+
+        val resolver = context.contentResolver
+        val displayName = sourceFile.name
+        val mimeType = MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(sourceFile.extension.lowercase())
+            ?: when (item.fileType) {
+                FileType.VIDEO -> "video/*"
+                FileType.AUDIO -> "audio/*"
+                FileType.DOCUMENT -> "application/pdf"
+                FileType.APK -> "application/vnd.android.package-archive"
+                FileType.IMAGE -> "image/*"
+                FileType.ARCHIVE -> "application/zip"
+                FileType.OTHER -> "application/octet-stream"
+            }
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+            put(
+                MediaStore.MediaColumns.RELATIVE_PATH,
+                "${Environment.DIRECTORY_DOWNLOADS}/File Station"
+            )
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val destinationUri = try {
+            resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        } catch (_: Exception) {
+            null
+        } ?: return false
+
+        var published = false
+        try {
+            val expectedLength = sourceFile.length()
+            val copiedLength = FileInputStream(sourceFile).use { input ->
+                resolver.openOutputStream(destinationUri, "w")?.use { output ->
+                    input.copyTo(output, bufferSize = 64 * 1024)
+                } ?: throw IllegalStateException("Cannot open the Downloads destination")
+            }
+            if (copiedLength != expectedLength) {
+                throw IllegalStateException("Exported file length does not match its source")
+            }
+            val publishValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }
+            if (resolver.update(destinationUri, publishValues, null, null) != 1) {
+                throw IllegalStateException("Cannot publish the completed Downloads item")
+            }
+            published = true
+            return true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return false
+        } finally {
+            if (!published) runCatching { resolver.delete(destinationUri, null, null) }
+        }
+    }
+
+    /** Copies a file to a user-selected SAF document URI on Android 9 and older. */
+    suspend fun exportToDocument(item: MediaItem, destinationUri: Uri): Boolean =
+        withContext(Dispatchers.IO) {
+            val sourceFile = File(item.filePath)
+            if (!sourceFile.isFile) return@withContext false
+            val resolver = context.contentResolver
+            var copied = false
+            try {
+                val expectedLength = sourceFile.length()
+                val copiedLength = FileInputStream(sourceFile).use { input ->
+                    resolver.openOutputStream(destinationUri, "w")?.use { output ->
+                        input.copyTo(output, bufferSize = 64 * 1024)
+                    } ?: throw IllegalStateException("Cannot open the selected destination")
+                }
+                if (copiedLength != expectedLength) {
+                    throw IllegalStateException("Exported file length does not match its source")
+                }
+                copied = true
+                true
+            } catch (e: Exception) {
+                e.printStackTrace()
+                false
+            } finally {
+                if (!copied) runCatching { resolver.delete(destinationUri, null, null) }
+            }
+        }
 }

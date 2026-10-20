@@ -1,9 +1,15 @@
 package com.example
 
+import android.app.Activity
+import android.content.Intent
+import android.os.Build
 import android.os.Bundle
+import android.webkit.MimeTypeMap
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -12,6 +18,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -19,6 +26,8 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.model.DuplicateAction
+import com.example.model.FileType
+import com.example.model.MediaItem
 import com.example.ui.MainViewModel
 import com.example.ui.components.DuplicateFileDialog
 import com.example.ui.components.FeaturePhoneGuideDialog
@@ -28,6 +37,7 @@ import com.example.ui.screens.LibraryScreen
 import com.example.ui.screens.SearchScreen
 import com.example.ui.screens.SpeedConverterScreen
 import com.example.ui.theme.AudioSpeedTheme
+import java.io.File
 
 class MainActivity : ComponentActivity() {
 
@@ -49,6 +59,19 @@ class MainActivity : ComponentActivity() {
 
                 var selectedTab by remember { mutableIntStateOf(0) }
                 var showGuideDialog by remember { mutableStateOf(false) }
+                var pendingExportItemId by rememberSaveable { mutableStateOf<String?>(null) }
+                val exportDocumentLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.StartActivityForResult()
+                ) { result ->
+                    val itemId = pendingExportItemId
+                    pendingExportItemId = null
+                    val destinationUri = result.data?.data
+                    if (result.resultCode == Activity.RESULT_OK && itemId != null && destinationUri != null) {
+                        viewModel.libraryItems.value.firstOrNull { it.id == itemId }?.let { item ->
+                            viewModel.exportToDocument(item, destinationUri)
+                        }
+                    }
+                }
 
                 LaunchedEffect(actionMessage) {
                     actionMessage?.let { msg ->
@@ -246,7 +269,25 @@ class MainActivity : ComponentActivity() {
                                 2 -> SpeedConverterScreen(viewModel = viewModel)
                                 3 -> LibraryScreen(
                                     viewModel = viewModel,
-                                    onNavigateToDownloader = { selectedTab = 0 }
+                                    onNavigateToDownloader = { selectedTab = 0 },
+                                    onExportItem = { item ->
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                            viewModel.exportToDownloads(item)
+                                        } else {
+                                            pendingExportItemId = item.id
+                                            val createDocumentIntent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                                                addCategory(Intent.CATEGORY_OPENABLE)
+                                                type = exportMimeType(item)
+                                                putExtra(Intent.EXTRA_TITLE, File(item.filePath).name)
+                                            }
+                                            try {
+                                                exportDocumentLauncher.launch(createDocumentIntent)
+                                            } catch (_: Exception) {
+                                                pendingExportItemId = null
+                                                viewModel.showActionMessage("تعذر فتح أداة اختيار موقع الحفظ")
+                                            }
+                                        }
+                                    }
                                 )
                             }
                         }
@@ -254,5 +295,17 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+}
+
+private fun exportMimeType(item: MediaItem): String {
+    val extension = File(item.filePath).extension.lowercase()
+    return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: when (item.fileType) {
+        FileType.VIDEO -> "video/*"
+        FileType.AUDIO -> "audio/*"
+        FileType.DOCUMENT -> "application/pdf"
+        FileType.APK -> "application/vnd.android.package-archive"
+        FileType.IMAGE -> "image/*"
+        FileType.ARCHIVE, FileType.OTHER -> "application/octet-stream"
     }
 }

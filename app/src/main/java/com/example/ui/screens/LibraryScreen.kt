@@ -35,6 +35,7 @@ import com.example.ui.components.formatFileSize
 fun LibraryScreen(
     viewModel: MainViewModel,
     onNavigateToDownloader: () -> Unit,
+    onExportItem: (MediaItem) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -167,7 +168,7 @@ fun LibraryScreen(
                                 context.startActivity(Intent.createChooser(intent, "مشاركة الملف"))
                             }
                         },
-                        onExport = { viewModel.exportToDownloads(item) },
+                        onExport = { onExportItem(item) },
                         onDelete = { viewModel.deleteItem(item) }
                     )
                 }
@@ -311,7 +312,7 @@ fun MediaItemCard(
                     IconButton(onClick = onExport, modifier = Modifier.size(34.dp)) {
                         Icon(
                             Icons.Default.DownloadForOffline,
-                            contentDescription = "تصدير إلى Downloads",
+                            contentDescription = "تصدير إلى Downloads أو اختيار موقع الحفظ",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(18.dp)
                         )

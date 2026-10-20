@@ -789,10 +789,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun exportToDownloads(item: MediaItem) {
         viewModelScope.launch {
             val success = repository.exportToPublicDownloads(item)
-            if (success) {
-                _actionMessage.value = "تم تصدير الملف إلى مجلد التنزيلات (Downloads) بالجهاز"
+            _actionMessage.value = if (success) {
+                "تم تصدير الملف إلى مجلد Downloads/File Station بالجهاز"
             } else {
-                _actionMessage.value = "فشل تصدير الملف"
+                "فشل تصدير الملف إلى مجلد التنزيلات"
+            }
+        }
+    }
+
+    fun exportToDocument(item: MediaItem, destinationUri: Uri) {
+        viewModelScope.launch {
+            val success = repository.exportToDocument(item, destinationUri)
+            _actionMessage.value = if (success) {
+                "تم حفظ نسخة من الملف في الموقع الذي اخترته"
+            } else {
+                "فشل حفظ الملف في الموقع المختار"
             }
         }
     }
