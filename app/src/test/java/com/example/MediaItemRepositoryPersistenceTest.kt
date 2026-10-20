@@ -82,6 +82,7 @@ class MediaItemRepositoryPersistenceTest {
         movedParent.deleteRecursively()
         File(existing.filePath).delete()
         File(incoming.filePath).delete()
+        Unit
     }
 
     @Test
