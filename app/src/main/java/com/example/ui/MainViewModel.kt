@@ -354,6 +354,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val downloadedList = mutableListOf<MediaItem>()
             var failedCount = 0
+            var resourceLimitFailure: String? = null
             val total = requests.size
 
             for ((index, request) in requests.withIndex()) {
@@ -386,6 +387,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     },
                     onSpeedProgress = { speedProgress, stage ->
+                        if (stage.startsWith("توقف التحويل بأمان:")) resourceLimitFailure = stage
                         _downloadState.value = DownloadState.ProcessingSpeed(
                             itemTitle = item.title,
                             progress = 0.7f + speedProgress * 0.3f,
@@ -403,14 +405,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             if (downloadedList.isEmpty()) {
-                _downloadState.value = DownloadState.Error("فشل تحميل جميع العناصر المحددة. لم يتم حفظ ملفات.")
-                _actionMessage.value = "فشل التحميل؛ لم يُحفظ أي ملف. تحقق من الرابط والاتصال ثم أعد المحاولة."
+                val message = resourceLimitFailure
+                    ?: "فشل تحميل جميع العناصر المحددة. لم يتم حفظ ملفات. تحقق من الرابط والاتصال ثم أعد المحاولة."
+                _downloadState.value = DownloadState.Error(message)
+                _actionMessage.value = message
             } else {
                 _downloadState.value = DownloadState.Completed(downloadedList, failedCount)
                 _actionMessage.value = if (failedCount == 0) {
                     "تم تحميل ${downloadedList.size} ملف بنجاح في File Station."
                 } else {
-                    "تم تحميل ${downloadedList.size} ملف، وفشل تحميل $failedCount عنصر."
+                    val reason = resourceLimitFailure?.let { " $it" }.orEmpty()
+                    "تم تحميل ${downloadedList.size} ملف، وفشل تحميل $failedCount عنصر.$reason"
                 }
             }
         }
@@ -538,6 +543,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 // Audio conversion or extracting audio from video with WSOLA speed & bitrate
                 var audioOutputInfo: AudioTranscoder.AudioOutputInfo? = null
+                var resourceLimitFailure: String? = null
                 val success = transcoder.transcodeAudio(
                     sourceUri = uri,
                     sourceFile = null,
@@ -546,6 +552,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     targetFormat = format,
                     bitrateKbps = bitrate.kbps,
                     onProgress = { progress, stage ->
+                        if (stage.startsWith("توقف التحويل بأمان:")) resourceLimitFailure = stage
                         _conversionState.value = ProcessingState.Processing(progress, stage)
                     },
                     onOutputInfo = { audioOutputInfo = it }
@@ -594,7 +601,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     _actionMessage.value = "تم تحويل الملف بنجاح! جاهز للاستماع والمشاركة."
                 } else {
-                    _conversionState.value = ProcessingState.Error("فشلت عملية التحويل. يرجى تجربة ملف آخر.")
+                    _conversionState.value = ProcessingState.Error(
+                        resourceLimitFailure ?: "فشلت عملية التحويل. يرجى تجربة ملف آخر."
+                    )
                 }
             }
         }

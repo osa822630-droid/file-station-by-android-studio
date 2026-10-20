@@ -2,6 +2,7 @@ package com.example
 
 import androidx.test.core.app.ApplicationProvider
 import com.example.audio.AudioTranscoder
+import com.example.audio.PcmFileUtils
 import com.example.audio.WavHelper
 import com.example.model.AudioFormat
 import kotlinx.coroutines.runBlocking
@@ -13,6 +14,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
+import java.io.RandomAccessFile
 import java.util.UUID
 
 @RunWith(RobolectricTestRunner::class)
@@ -76,6 +78,38 @@ class AudioTranscoderAtomicOutputTest {
             assertTrue(destination.length() > 100L)
             assertFalse(destination.readBytes().contentEquals(previousContents))
             assertTrue(workDir.listFiles().orEmpty().none { it.name.contains(".pending.") })
+        } finally {
+            workDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun oversizedSpeedChangeFailsBeforeLoadingPcmIntoMemoryAndShowsTheReason() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val workDir = File(context.cacheDir, "bounded-pcm-${UUID.randomUUID()}").apply { mkdirs() }
+        val rawPcm = File(workDir, "large-source.pcm")
+        val input = File(workDir, "large-source.wav")
+        val output = File(workDir, "large-output.mp3")
+        val wsolaLimit = PcmFileUtils.maxWsolaInputBytes()
+        val pcmBytes = wsolaLimit + if (wsolaLimit % 2L == 0L) 2L else 1L
+
+        try {
+            RandomAccessFile(rawPcm, "rw").use { it.setLength(pcmBytes) }
+            assertTrue(WavHelper.writeWavFileFromPcmFile(input, rawPcm, 44_100, 1))
+            val stages = mutableListOf<String>()
+            val result = AudioTranscoder(context).transcodeAudio(
+                sourceUri = null,
+                sourceFile = input,
+                outputFile = output,
+                targetSpeed = 0.5f,
+                targetFormat = AudioFormat.MP3,
+                onProgress = { _, stage -> stages += stage }
+            )
+
+            assertFalse("Unsafe WSOLA working memory must fail cleanly", result)
+            assertTrue("The failure should tell the user which resource limit was reached",
+                stages.any { it.startsWith("توقف التحويل بأمان:") })
+            assertFalse("No partial output may be published", output.exists())
         } finally {
             workDir.deleteRecursively()
         }

@@ -12,8 +12,8 @@ import com.example.model.AudioFormat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.nio.ByteOrder
 import java.util.UUID
 
 class AudioTranscoder(private val context: Context) {
@@ -86,7 +86,8 @@ class AudioTranscoder(private val context: Context) {
                 onOutputInfo = { outputInfo = it },
                 onProgress = onProgress
             )
-            if (!encoded || !isValidEncodedAudio(stagedOutput, targetFormat)) {
+            if (!encoded) return@withContext false
+            if (!isValidEncodedAudio(stagedOutput, targetFormat)) {
                 onProgress(0.99f, "تعذر التحقق من ملف الصوت الناتج؛ لم يُستبدل الملف السابق.")
                 return@withContext false
             }
@@ -126,53 +127,78 @@ class AudioTranscoder(private val context: Context) {
         onOutputInfo: (AudioOutputInfo) -> Unit,
         onProgress: (progress: Float, stage: String) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
-        // Each advertised audio extension is paired with its own real encoder/container.
         if (targetFormat != AudioFormat.WAV && targetFormat != AudioFormat.M4A &&
-            targetFormat != AudioFormat.MP3) {
-            return@withContext false
-        }
-        if (!outputFile.extension.equals(targetFormat.extension, ignoreCase = true)) {
-            return@withContext false
-        }
+            targetFormat != AudioFormat.MP3) return@withContext false
+        if (!outputFile.extension.equals(targetFormat.extension, ignoreCase = true)) return@withContext false
 
+        val workingFiles = mutableListOf<File>()
         try {
-            onProgress(0.05f, "قراءة وفك تشفير الصوت...")
-            val decoded = decodeToPcm(sourceUri, sourceFile) { decodeProgress ->
+            onProgress(0.05f, "قراءة وفك تشفير الصوت إلى ملف مؤقت محدود الذاكرة...")
+            val decoded = decodeToPcmFile(sourceUri, sourceFile) { decodeProgress ->
                 onProgress(0.05f + decodeProgress * 0.35f, "فك تشفير الصوت (${(decodeProgress * 100).toInt()}%)")
             } ?: return@withContext false
+            workingFiles += decoded.file
 
-            val finalSamples: ShortArray
+            val originalSampleRate = decoded.sampleRate
+            val originalChannels = decoded.channels
+            var pcmFile = decoded.file
+            var sampleRate = decoded.sampleRate
+            var channels = decoded.channels
+
             if (kotlin.math.abs(targetSpeed - 1.0f) > 0.01f) {
-                onProgress(0.40f, "تعديل السرعة إلى ${targetSpeed}x مع الحفاظ على النبرة...")
-                finalSamples = WsolaTimeStretcher.process(
-                    input = decoded.samples,
-                    sampleRate = decoded.sampleRate,
-                    channels = decoded.channels,
-                    speed = targetSpeed
-                ) { stretchProgress ->
-                    onProgress(0.40f + stretchProgress * 0.35f, "معالجة سرعة الصوت (${(stretchProgress * 100).toInt()}%)")
+                val maxInputBytes = PcmFileUtils.maxWsolaInputBytes()
+                if (pcmFile.length() > maxInputBytes) {
+                    throw PcmResourceLimitException(
+                        "تغيير السرعة متاح لهذا الملف حتى ${maxInputBytes / (1024 * 1024)} MiB من PCM؛ " +
+                            "اختر سرعة 1x للمعالجة المتدفقة أو ملفًا أقصر."
+                    )
                 }
-            } else {
-                finalSamples = decoded.samples
+                onProgress(0.40f, "تعديل السرعة إلى ${targetSpeed}x مع الحفاظ على النبرة...")
+                val samples = PcmFileUtils.readSamples(pcmFile, maxInputBytes)
+                    ?: throw PcmResourceLimitException("تعذر تحميل كتلة الصوت ضمن حد الذاكرة الآمن.")
+                val maxOutputSamples = (PcmFileUtils.maxWsolaOutputBytes() / 2L)
+                    .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                val stretched = WsolaTimeStretcher.process(
+                    input = samples,
+                    sampleRate = sampleRate,
+                    channels = channels,
+                    speed = targetSpeed,
+                    maxOutputSamples = maxOutputSamples
+                ) { stretchProgress ->
+                    onProgress(0.40f + stretchProgress * 0.35f,
+                        "معالجة سرعة الصوت (${(stretchProgress * 100).toInt()}%)")
+                }
+                val stretchedFile = PcmFileUtils.newRawFile(context.cacheDir, "stretched_audio")
+                workingFiles += stretchedFile
+                PcmFileUtils.writeSamples(stretchedFile, stretched)
+                pcmFile = stretchedFile
             }
 
             val aacSettings = if (targetFormat == AudioFormat.M4A) {
-                selectAacEncoderSettings(decoded.sampleRate, decoded.channels, bitrateKbps)
+                selectAacEncoderSettings(sampleRate, channels, bitrateKbps)
                     ?: return@withContext false
             } else null
-            val encodedSamples = if (aacSettings != null) {
-                preparePcmForAac(
-                    pcmData = finalSamples,
-                    sourceSampleRate = decoded.sampleRate,
-                    sourceChannels = decoded.channels,
-                    target = aacSettings
+            if (aacSettings != null) {
+                val convertedFile = PcmFileUtils.newRawFile(context.cacheDir, "aac_input")
+                val converted = PcmSampleRateConverter.convertRawFile(
+                    inputFile = pcmFile,
+                    outputFile = convertedFile,
+                    sourceSampleRate = sampleRate,
+                    sourceChannels = channels,
+                    targetSampleRate = aacSettings.sampleRate,
+                    targetChannels = aacSettings.channels
                 ) ?: return@withContext false
-            } else finalSamples
+                workingFiles += convertedFile
+                pcmFile = converted.file
+                sampleRate = converted.sampleRate
+                channels = converted.channels
+            }
+
             val appliedBitrateKbps = aacSettings?.bitrateKbps ?: AudioBitratePolicy.appliedKbps(
                 format = targetFormat,
                 requestedKbps = bitrateKbps,
-                sampleRate = decoded.sampleRate,
-                channels = decoded.channels
+                sampleRate = sampleRate,
+                channels = channels
             ) ?: return@withContext false
             val bitrateDescription = when {
                 targetFormat == AudioFormat.WAV -> "PCM WAV بمعدل خام يقارب ${appliedBitrateKbps} kbps"
@@ -184,40 +210,39 @@ class AudioTranscoder(private val context: Context) {
 
             var actualAacOutput: AacOutputFormat? = null
             val success = when (targetFormat) {
-                AudioFormat.WAV -> {
-                    WavHelper.writeWavFile(
-                        outputFile = outputFile,
-                        pcmData = finalSamples,
-                        sampleRate = decoded.sampleRate,
-                        channels = decoded.channels
-                    )
-                    true
-                }
-                AudioFormat.MP3 -> encodePcmToMp3(
-                    pcmData = finalSamples,
-                    sampleRate = decoded.sampleRate,
-                    channels = decoded.channels,
+                AudioFormat.WAV -> WavHelper.writeWavFileFromPcmFile(
+                    outputFile = outputFile,
+                    pcmFile = pcmFile,
+                    sampleRate = sampleRate,
+                    channels = channels
+                )
+                AudioFormat.MP3 -> encodePcmFileToMp3(
+                    pcmFile = pcmFile,
+                    sampleRate = sampleRate,
+                    channels = channels,
                     outputFile = outputFile,
                     bitrateKbps = appliedBitrateKbps
                 ) { encodeProgress ->
-                    onProgress(0.80f + encodeProgress * 0.20f, "ترميز MP3 (${(encodeProgress * 100).toInt()}%)")
+                    onProgress(0.80f + encodeProgress * 0.20f,
+                        "ترميز MP3 (${(encodeProgress * 100).toInt()}%)")
                 }
-                AudioFormat.M4A -> encodePcmToM4a(
-                    pcmData = encodedSamples,
+                AudioFormat.M4A -> encodePcmFileToM4a(
+                    pcmFile = pcmFile,
                     settings = aacSettings ?: return@withContext false,
                     outputFile = outputFile,
                     onOutputFormat = { actualAacOutput = it }
                 ) { encodeProgress ->
                     val visibleProgress = encodeProgress.coerceAtMost(0.99f)
-                    onProgress(0.80f + visibleProgress * 0.20f, "ترميز AAC داخل M4A (${(visibleProgress * 100).toInt()}%)")
+                    onProgress(0.80f + visibleProgress * 0.20f,
+                        "ترميز AAC داخل M4A (${(visibleProgress * 100).toInt()}%)")
                 }
                 else -> false
             }
 
             if (success) {
-                val actualSampleRate = actualAacOutput?.sampleRate ?: aacSettings?.sampleRate ?: decoded.sampleRate
+                val actualSampleRate = actualAacOutput?.sampleRate ?: aacSettings?.sampleRate ?: sampleRate
                 val actualChannels = actualAacOutput?.channels ?: aacSettings?.channels ?:
-                    if (targetFormat == AudioFormat.MP3 && decoded.channels > 2) 1 else decoded.channels
+                    if (targetFormat == AudioFormat.MP3 && channels > 2) 1 else channels
                 val actualBitrate = actualAacOutput?.bitrateKbps ?: appliedBitrateKbps
                 onOutputInfo(
                     AudioOutputInfo(
@@ -226,15 +251,23 @@ class AudioTranscoder(private val context: Context) {
                         appliedBitrateKbps = actualBitrate,
                         sampleRate = actualSampleRate,
                         channels = actualChannels,
-                        sourceSampleRate = decoded.sampleRate,
-                        sourceChannels = decoded.channels
+                        sourceSampleRate = originalSampleRate,
+                        sourceChannels = originalChannels
                     )
                 )
             }
             success
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (e: PcmResourceLimitException) {
+            val message = "توقف التحويل بأمان: ${e.message ?: "تجاوز الملف الحد الآمن للموارد."}"
+            onProgress(0.99f, message)
+            android.util.Log.w("AudioTranscoder", message)
             false
+        } catch (e: Exception) {
+            android.util.Log.e("AudioTranscoder", "Audio transcode failed before publish", e)
+            onProgress(0.99f, "فشل تحويل الصوت؛ لم يُنشر ملف جزئي.")
+            false
+        } finally {
+            workingFiles.forEach { it.delete() }
         }
     }
 
@@ -279,219 +312,233 @@ class AudioTranscoder(private val context: Context) {
         }
     }
 
-    private fun decodeToPcm(
+    private fun decodeToPcmFile(
         sourceUri: Uri?,
         sourceFile: File?,
         onProgress: (Float) -> Unit
-    ): DecodedPcm? {
+    ): PcmFileMetadata? {
         var tempCachedFile: File? = null
-        val fileToProcess: File? = try {
-            if (sourceFile != null && sourceFile.exists()) {
-                sourceFile
-            } else if (sourceUri != null) {
-                // Copy stream to cache file to ensure MediaExtractor has a real, seekable file
-                val cacheFile = File(context.cacheDir, "input_transcode_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(6)}.tmp")
-                context.contentResolver.openInputStream(sourceUri)?.use { input ->
-                    FileOutputStream(cacheFile).use { output ->
-                        input.copyTo(output)
+        var pcmOutputFile: File? = null
+        var success = false
+        try {
+            val fileToProcess = when {
+                sourceFile != null && sourceFile.isFile -> sourceFile
+                sourceUri != null -> {
+                    val cacheFile = PcmFileUtils.newRawFile(context.cacheDir, "input_transcode")
+                    tempCachedFile = cacheFile
+                    val input = context.contentResolver.openInputStream(sourceUri)
+                        ?: throw IllegalStateException("تعذر فتح الملف المحدد للقراءة.")
+                    input.use { source ->
+                        FileOutputStream(cacheFile).buffered().use { output ->
+                            val buffer = ByteArray(64 * 1024)
+                            var copied = 0L
+                            while (true) {
+                                val read = source.read(buffer)
+                                if (read < 0) break
+                                if (read == 0) continue
+                                copied += read
+                                if (copied > PcmFileUtils.MAX_SOURCE_FILE_BYTES) {
+                                    throw PcmResourceLimitException("حجم الملف الأصلي يتجاوز حد الإدخال الآمن (1 GiB).")
+                                }
+                                output.write(buffer, 0, read)
+                            }
+                        }
                     }
+                    cacheFile
                 }
-                tempCachedFile = cacheFile
-                cacheFile
-            } else {
-                null
+                else -> null
+            } ?: return null
+
+            if (!fileToProcess.isFile || fileToProcess.length() < 32L) return null
+            if (fileToProcess.length() > PcmFileUtils.MAX_SOURCE_FILE_BYTES) {
+                throw PcmResourceLimitException("حجم الملف الأصلي يتجاوز حد الإدخال الآمن (1 GiB).")
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
-        }
 
-        if (fileToProcess == null || !fileToProcess.exists() || fileToProcess.length() < 32) {
-            tempCachedFile?.delete()
-            return null
-        }
-
-        // 1. Direct WAV reading fast path (avoids NuMediaExtractor entirely for WAV)
-        try {
-            val wavResult = WavHelper.readWavFile(fileToProcess)
-            if (wavResult != null) {
-                tempCachedFile?.delete()
-                onProgress(1.0f)
-                return wavResult
+            val rawFile = PcmFileUtils.newRawFile(context.cacheDir, "decoded_audio")
+            pcmOutputFile = rawFile
+            val wavMetadata = WavHelper.copyWavPcmToRawFile(
+                inputFile = fileToProcess,
+                rawOutputFile = rawFile,
+                maxPcmBytes = PcmFileUtils.MAX_DECODED_PCM_BYTES
+            )
+            if (wavMetadata != null) {
+                if (wavMetadata.durationUs > PcmFileUtils.MAX_DURATION_US) {
+                    throw PcmResourceLimitException("مدة الملف تتجاوز الحد الأقصى للتحويل (120 دقيقة).")
+                }
+                onProgress(1f)
+                success = true
+                return wavMetadata
             }
-        } catch (_: Exception) {}
+            rawFile.delete()
 
-        // Check if file is invalid HTML/JSON text response
-        try {
-            val headerBytes = ByteArray(32)
-            java.io.FileInputStream(fileToProcess).use { it.read(headerBytes) }
-            val headerString = String(headerBytes, Charsets.UTF_8).lowercase()
+            // Reject obvious text responses before invoking platform media codecs.
+            val headerBytes = ByteArray(64)
+            FileInputStream(fileToProcess).use { it.read(headerBytes) }
+            val headerString = String(headerBytes, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\t', '\r', '\n').lowercase()
             if (headerString.startsWith("<!doc") || headerString.startsWith("<html") ||
                 headerString.startsWith("{\"error") || headerString.startsWith("<?xml")) {
-                tempCachedFile?.delete()
                 return null
             }
-        } catch (_: Exception) {}
 
-        // 2. Decode using MediaExtractor + MediaCodec
-        val extractor = MediaExtractor()
-        var decoder: MediaCodec? = null
-        try {
-            extractor.setDataSource(fileToProcess.absolutePath)
-
-            var audioTrackIndex = -1
-            var trackFormat: MediaFormat? = null
-            var mime: String? = null
-
-            for (i in 0 until extractor.trackCount) {
-                val format = extractor.getTrackFormat(i)
-                val m = format.getString(MediaFormat.KEY_MIME) ?: ""
-                if (m.startsWith("audio/")) {
-                    audioTrackIndex = i
-                    trackFormat = format
-                    mime = m
-                    break
+            val extractor = MediaExtractor()
+            var decoder: MediaCodec? = null
+            try {
+                extractor.setDataSource(fileToProcess.absolutePath)
+                var audioTrackIndex = -1
+                var trackFormat: MediaFormat? = null
+                var mime: String? = null
+                for (index in 0 until extractor.trackCount) {
+                    val format = extractor.getTrackFormat(index)
+                    val type = format.getString(MediaFormat.KEY_MIME).orEmpty()
+                    if (type.startsWith("audio/")) {
+                        audioTrackIndex = index
+                        trackFormat = format
+                        mime = type
+                        break
+                    }
                 }
-            }
+                if (audioTrackIndex < 0 || trackFormat == null || mime == null) return null
+                extractor.selectTrack(audioTrackIndex)
 
-            if (audioTrackIndex < 0 || trackFormat == null || mime == null) {
-                return null
-            }
+                val declaredDurationUs = if (trackFormat.containsKey(MediaFormat.KEY_DURATION)) {
+                    trackFormat.getLong(MediaFormat.KEY_DURATION)
+                } else 0L
+                if (declaredDurationUs > PcmFileUtils.MAX_DURATION_US) {
+                    throw PcmResourceLimitException("مدة الملف تتجاوز الحد الأقصى للتحويل (120 دقيقة).")
+                }
+                var sampleRate = if (trackFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                    trackFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                } else 44_100
+                var channels = if (trackFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                    trackFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                } else 2
+                if (sampleRate <= 0 || channels <= 0 || channels > 32) {
+                    throw IllegalStateException("Decoder returned invalid PCM metadata")
+                }
 
-            extractor.selectTrack(audioTrackIndex)
+                val activeDecoder = MediaCodec.createDecoderByType(mime)
+                decoder = activeDecoder
+                activeDecoder.configure(trackFormat, null, null, 0)
+                activeDecoder.start()
+                val bufferInfo = MediaCodec.BufferInfo()
+                var inputEos = false
+                var outputEos = false
+                var decodedBytes = 0L
+                var idleIterations = 0
+                val timeoutUs = 5_000L
+                val copyBuffer = ByteArray(64 * 1024)
 
-            val sampleRate = if (trackFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
-                trackFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-            } else 44100
+                java.io.BufferedOutputStream(FileOutputStream(rawFile), 64 * 1024).use { pcmOutput ->
+                    while (!outputEos) {
+                        var madeProgress = false
+                        if (!inputEos) {
+                            val inputIndex = activeDecoder.dequeueInputBuffer(timeoutUs)
+                            if (inputIndex >= 0) {
+                                val inputBuffer = activeDecoder.getInputBuffer(inputIndex)
+                                if (inputBuffer != null) {
+                                    madeProgress = true
+                                    val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                                    if (sampleSize < 0) {
+                                        activeDecoder.queueInputBuffer(
+                                            inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                        )
+                                        inputEos = true
+                                    } else {
+                                        activeDecoder.queueInputBuffer(
+                                            inputIndex, 0, sampleSize, extractor.sampleTime, 0
+                                        )
+                                        extractor.advance()
+                                    }
+                                }
+                            }
+                        }
 
-            val channels = if (trackFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
-                trackFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-            } else 2
-
-            val durationUs = if (trackFormat.containsKey(MediaFormat.KEY_DURATION)) {
-                trackFormat.getLong(MediaFormat.KEY_DURATION)
-            } else 0L
-
-            val activeDecoder = MediaCodec.createDecoderByType(mime)
-            decoder = activeDecoder
-            activeDecoder.configure(trackFormat, null, null, 0)
-            activeDecoder.start()
-
-            val pcmChunks = mutableListOf<ShortArray>()
-            var totalSamples = 0L
-            var decodedSampleRate = sampleRate
-            var decodedChannels = channels
-            var decodedPcmEncoding = android.media.AudioFormat.ENCODING_PCM_16BIT
-
-            val bufferInfo = MediaCodec.BufferInfo()
-            var isInputEos = false
-            var isOutputEos = false
-            val timeoutUs = 5000L
-
-            var idleIterationCount = 0
-            while (!isOutputEos) {
-                var madeProgress = false
-                if (!isInputEos) {
-                    val inIndex = activeDecoder.dequeueInputBuffer(timeoutUs)
-                    if (inIndex >= 0) {
-                        val inputBuffer = activeDecoder.getInputBuffer(inIndex)
-                        if (inputBuffer != null) {
-                            madeProgress = true
-                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
-                            if (sampleSize < 0) {
-                                activeDecoder.queueInputBuffer(
-                                    inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                                )
-                                isInputEos = true
-                            } else {
-                                val sampleTime = extractor.sampleTime
-                                activeDecoder.queueInputBuffer(inIndex, 0, sampleSize, sampleTime, 0)
-                                extractor.advance()
+                        val outputIndex = activeDecoder.dequeueOutputBuffer(bufferInfo, timeoutUs)
+                        when {
+                            outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                                madeProgress = true
+                                val outputFormat = activeDecoder.outputFormat
+                                sampleRate = if (outputFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                                    outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                                } else sampleRate
+                                channels = if (outputFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                                    outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                                } else channels
+                                val pcmEncoding = if (outputFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
+                                    outputFormat.getInteger(MediaFormat.KEY_PCM_ENCODING)
+                                } else android.media.AudioFormat.ENCODING_PCM_16BIT
+                                if (pcmEncoding != android.media.AudioFormat.ENCODING_PCM_16BIT) {
+                                    throw IllegalStateException("Only 16-bit PCM decoder output is supported")
+                                }
+                                if (sampleRate <= 0 || channels <= 0 || channels > 32) {
+                                    throw IllegalStateException("Decoder returned invalid PCM metadata")
+                                }
+                            }
+                            outputIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> madeProgress = true
+                            outputIndex >= 0 -> {
+                                madeProgress = true
+                                val outputBuffer = activeDecoder.getOutputBuffer(outputIndex)
+                                if (outputBuffer != null && bufferInfo.size > 0) {
+                                    if (decodedBytes + bufferInfo.size > PcmFileUtils.MAX_DECODED_PCM_BYTES) {
+                                        activeDecoder.releaseOutputBuffer(outputIndex, false)
+                                        throw PcmResourceLimitException(
+                                            "الصوت بعد فك الضغط يتجاوز الحد الآمن للبيانات المؤقتة (512 MiB)."
+                                        )
+                                    }
+                                    outputBuffer.position(bufferInfo.offset)
+                                    outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                                    while (outputBuffer.hasRemaining()) {
+                                        val count = minOf(copyBuffer.size, outputBuffer.remaining())
+                                        outputBuffer.get(copyBuffer, 0, count)
+                                        pcmOutput.write(copyBuffer, 0, count)
+                                    }
+                                    decodedBytes += bufferInfo.size
+                                    if (declaredDurationUs > 0L) {
+                                        val progress = (bufferInfo.presentationTimeUs.toFloat() / declaredDurationUs)
+                                            .coerceIn(0f, 1f)
+                                        onProgress(progress)
+                                    }
+                                }
+                                activeDecoder.releaseOutputBuffer(outputIndex, false)
+                                if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                                    outputEos = true
+                                }
+                            }
+                        }
+                        if (madeProgress) idleIterations = 0 else {
+                            idleIterations++
+                            if (idleIterations > 6_000) {
+                                throw IllegalStateException("Audio decoder stalled before end of stream")
                             }
                         }
                     }
                 }
 
-                val outIndex = activeDecoder.dequeueOutputBuffer(bufferInfo, timeoutUs)
-                when {
-                    outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        madeProgress = true
-                        val outputFormat = activeDecoder.outputFormat
-                        decodedSampleRate = if (outputFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
-                            outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                        } else decodedSampleRate
-                        decodedChannels = if (outputFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
-                            outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        } else decodedChannels
-                        decodedPcmEncoding = if (outputFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
-                            outputFormat.getInteger(MediaFormat.KEY_PCM_ENCODING)
-                        } else android.media.AudioFormat.ENCODING_PCM_16BIT
-                        if (decodedPcmEncoding != android.media.AudioFormat.ENCODING_PCM_16BIT) {
-                            throw IllegalStateException("Only 16-bit PCM decoder output is supported")
-                        }
-                        if (decodedSampleRate <= 0 || decodedChannels <= 0) {
-                            throw IllegalStateException("Decoder returned invalid PCM metadata")
-                        }
-                    }
-                    outIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> {
-                        madeProgress = true
-                    }
-                    outIndex >= 0 -> {
-                        madeProgress = true
-                        val outputBuffer = activeDecoder.getOutputBuffer(outIndex)
-                        if (outputBuffer != null && bufferInfo.size > 0) {
-                            outputBuffer.position(bufferInfo.offset)
-                            outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
-                            val shortBuf = outputBuffer.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
-                            val shorts = ShortArray(shortBuf.remaining())
-                            shortBuf.get(shorts)
-                            pcmChunks.add(shorts)
-                            totalSamples += shorts.size
-
-                            if (durationUs > 0) {
-                                val progress = (bufferInfo.presentationTimeUs.toFloat() / durationUs).coerceIn(0.0f, 1.0f)
-                                onProgress(progress)
-                            }
-                        }
-                        activeDecoder.releaseOutputBuffer(outIndex, false)
-
-                        if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                            isOutputEos = true
-                        }
-                    }
+                val frameBytes = channels.toLong() * 2L
+                if (decodedBytes <= 0L || decodedBytes % frameBytes != 0L) return null
+                val actualDurationUs =
+                    (decodedBytes * 1_000_000L) / (sampleRate.toLong() * frameBytes)
+                if (declaredDurationUs > PcmFileUtils.MAX_DURATION_US ||
+                    actualDurationUs > PcmFileUtils.MAX_DURATION_US) {
+                    throw PcmResourceLimitException("مدة الملف تتجاوز الحد الأقصى للتحويل (120 دقيقة).")
                 }
-                if (madeProgress) {
-                    idleIterationCount = 0
-                } else {
-                    idleIterationCount++
-                    if (idleIterationCount > 6000) {
-                        throw IllegalStateException("Audio decoder stalled before end of stream")
-                    }
-                }
+                val durationUs = if (declaredDurationUs > 0L) declaredDurationUs else actualDurationUs
+                onProgress(1f)
+                success = true
+                return PcmFileMetadata(rawFile, sampleRate, channels, durationUs)
+            } finally {
+                try { decoder?.stop() } catch (_: Exception) {}
+                try { decoder?.release() } catch (_: Exception) {}
+                try { extractor.release() } catch (_: Exception) {}
             }
-
-            // Merge PCM chunks
-            val merged = ShortArray(totalSamples.toInt())
-            var offset = 0
-            for (chunk in pcmChunks) {
-                System.arraycopy(chunk, 0, merged, offset, chunk.size)
-                offset += chunk.size
-            }
-
-            return DecodedPcm(
-                samples = merged,
-                sampleRate = decodedSampleRate,
-                channels = decodedChannels,
-                durationUs = durationUs
-            )
+        } catch (e: PcmResourceLimitException) {
+            throw e
         } catch (e: Exception) {
-            e.printStackTrace()
+            android.util.Log.w("AudioTranscoder", "Unable to decode audio to PCM file", e)
             return null
         } finally {
-            try { decoder?.stop() } catch (_: Exception) {}
-            try { decoder?.release() } catch (_: Exception) {}
-            try { extractor.release() } catch (_: Exception) {}
             tempCachedFile?.delete()
+            if (!success) pcmOutputFile?.delete()
         }
     }
 
@@ -569,61 +616,24 @@ class AudioTranscoder(private val context: Context) {
         return null
     }
 
-    private fun preparePcmForAac(
-        pcmData: ShortArray,
-        sourceSampleRate: Int,
-        sourceChannels: Int,
-        target: AacEncoderSettings
-    ): ShortArray? {
-        if (sourceSampleRate <= 0 || sourceChannels <= 0 || pcmData.isEmpty() ||
-            pcmData.size % sourceChannels != 0) return null
-        val channelAdjusted = when {
-            sourceChannels == target.channels -> pcmData
-            target.channels == 1 && sourceChannels > 1 -> downmixToMono(pcmData, sourceChannels)
-            else -> return null
-        }
-        return PcmSampleRateConverter.resample(
-            pcmData = channelAdjusted,
-            sourceSampleRate = sourceSampleRate,
-            targetSampleRate = target.sampleRate,
-            channels = target.channels
-        )
-    }
-
-    private fun downmixToMono(pcmData: ShortArray, originalChannels: Int): ShortArray {
-        if (originalChannels <= 1) return pcmData
-        val numFrames = pcmData.size / originalChannels
-        val mono = ShortArray(numFrames)
-        for (i in 0 until numFrames) {
-            var sum = 0
-            for (c in 0 until originalChannels) {
-                sum += pcmData[i * originalChannels + c].toInt()
-            }
-            mono[i] = (sum / originalChannels).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-        }
-        return mono
-    }
-
     /**
-     * Encodes PCM with the pure-Java LAME implementation and publishes only after
+     * Encodes PCM from a bounded file in fixed-size frames and publishes only after
      * a valid MPEG Layer III frame has been written to a staged file.
      */
-    private fun encodePcmToMp3(
-        pcmData: ShortArray,
+    private fun encodePcmFileToMp3(
+        pcmFile: File,
         sampleRate: Int,
         channels: Int,
         outputFile: File,
         bitrateKbps: Int,
         onProgress: (Float) -> Unit
     ): Boolean {
-        if (pcmData.isEmpty() || sampleRate <= 0 || channels <= 0 || pcmData.size % channels != 0) {
-            return false
-        }
-
+        val frameBytes = channels.toLong() * 2L
+        if (!pcmFile.isFile || pcmFile.length() <= 0L || sampleRate <= 0 || channels <= 0 ||
+            pcmFile.length() % frameBytes != 0L) return false
         val outputChannels = if (channels <= 2) channels else 1
-        val pcmToEncode = if (channels <= 2) pcmData else downmixToMono(pcmData, channels)
-        val totalFrames = pcmToEncode.size / outputChannels
-        if (totalFrames <= 0) return false
+        val totalFrames = pcmFile.length() / frameBytes
+        if (totalFrames <= 0L) return false
 
         val parent = outputFile.parentFile ?: return false
         if (!parent.exists() && !parent.mkdirs()) return false
@@ -634,33 +644,66 @@ class AudioTranscoder(private val context: Context) {
         try {
             val activeEncoder = Mp3PcmEncoder(sampleRate, outputChannels, bitrateKbps)
             encoder = activeEncoder
-            val blockFrames = 4096
-            val encodedBuffer = ByteArray(blockFrames + blockFrames / 4 + 7200)
-            var frameOffset = 0
+            val blockFrames = 4_096
+            val sourceBuffer = ByteArray(blockFrames * channels * 2)
+            val pcmBlock = ShortArray(blockFrames * outputChannels)
+            val encodedBuffer = ByteArray(blockFrames + blockFrames / 4 + 7_200)
+            var framesEncoded = 0L
 
-            FileOutputStream(stagedFile).use { output ->
-                while (frameOffset < totalFrames) {
-                    val frames = minOf(blockFrames, totalFrames - frameOffset)
-                    val encodedBytes = activeEncoder.encodeInterleaved(
-                        pcm = pcmToEncode,
-                        frameOffset = frameOffset,
-                        frameCount = frames,
-                        output = encodedBuffer
-                    )
-                    if (encodedBytes < 0 || encodedBytes > encodedBuffer.size) {
-                        throw IllegalStateException("LAME MP3 encoding failed (code $encodedBytes)")
+            java.io.BufferedInputStream(FileInputStream(pcmFile), 64 * 1024).use { input ->
+                FileOutputStream(stagedFile).use { output ->
+                    while (framesEncoded < totalFrames) {
+                        val frames = minOf(blockFrames.toLong(), totalFrames - framesEncoded).toInt()
+                        val bytesToRead = frames * channels * 2
+                        var readCount = 0
+                        while (readCount < bytesToRead) {
+                            val read = input.read(sourceBuffer, readCount, bytesToRead - readCount)
+                            if (read < 0) throw IllegalStateException("Truncated PCM file during MP3 encoding")
+                            if (read == 0) continue
+                            readCount += read
+                        }
+                        for (frame in 0 until frames) {
+                            if (channels <= 2) {
+                                for (channel in 0 until channels) {
+                                    val offset = (frame * channels + channel) * 2
+                                    val low = sourceBuffer[offset].toInt() and 0xff
+                                    val high = sourceBuffer[offset + 1].toInt()
+                                    pcmBlock[frame * outputChannels + channel] = (low or (high shl 8)).toShort()
+                                }
+                            } else {
+                                var sum = 0
+                                for (channel in 0 until channels) {
+                                    val offset = (frame * channels + channel) * 2
+                                    val low = sourceBuffer[offset].toInt() and 0xff
+                                    val high = sourceBuffer[offset + 1].toInt()
+                                    sum += (low or (high shl 8)).toShort().toInt()
+                                }
+                                pcmBlock[frame] = (sum / channels)
+                                    .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                            }
+                        }
+
+                        val encodedBytes = activeEncoder.encodeInterleaved(
+                            pcm = pcmBlock,
+                            frameOffset = 0,
+                            frameCount = frames,
+                            output = encodedBuffer
+                        )
+                        if (encodedBytes < 0 || encodedBytes > encodedBuffer.size) {
+                            throw IllegalStateException("LAME MP3 encoding failed (code $encodedBytes)")
+                        }
+                        if (encodedBytes > 0) output.write(encodedBuffer, 0, encodedBytes)
+                        framesEncoded += frames
+                        onProgress((framesEncoded.toFloat() / totalFrames).coerceIn(0f, 0.99f))
                     }
-                    if (encodedBytes > 0) output.write(encodedBuffer, 0, encodedBytes)
-                    frameOffset += frames
-                    onProgress((frameOffset.toFloat() / totalFrames).coerceIn(0f, 0.99f))
-                }
 
-                val flushBytes = activeEncoder.flush(encodedBuffer)
-                if (flushBytes < 0 || flushBytes > encodedBuffer.size) {
-                    throw IllegalStateException("LAME MP3 finalization failed (code $flushBytes)")
+                    val flushBytes = activeEncoder.flush(encodedBuffer)
+                    if (flushBytes < 0 || flushBytes > encodedBuffer.size) {
+                        throw IllegalStateException("LAME MP3 finalization failed (code $flushBytes)")
+                    }
+                    if (flushBytes > 0) output.write(encodedBuffer, 0, flushBytes)
+                    output.flush()
                 }
-                if (flushBytes > 0) output.write(encodedBuffer, 0, flushBytes)
-                output.flush()
             }
 
             if (stagedFile.length() <= 64L || !containsMpegLayer3Frame(stagedFile)) {
@@ -672,7 +715,7 @@ class AudioTranscoder(private val context: Context) {
             success = outputFile.isFile && outputFile.length() > 64L && containsMpegLayer3Frame(outputFile)
             return success
         } catch (e: Exception) {
-            e.printStackTrace()
+            android.util.Log.e("AudioTranscoder", "MP3 file-stream encoding failed", e)
             return false
         } finally {
             try { encoder?.close() } catch (_: Exception) {}
@@ -728,8 +771,8 @@ class AudioTranscoder(private val context: Context) {
      * Unsupported output formats are rejected by [transcodeAudio] instead of being
      * written as AAC or WAV under a misleading extension.
      */
-    private fun encodePcmToM4a(
-        pcmData: ShortArray,
+    private fun encodePcmFileToM4a(
+        pcmFile: File,
         settings: AacEncoderSettings,
         outputFile: File,
         onOutputFormat: (AacOutputFormat) -> Unit,
@@ -737,10 +780,12 @@ class AudioTranscoder(private val context: Context) {
     ): Boolean {
         val sampleRate = settings.sampleRate
         val outputChannels = settings.channels
-        val pcmToEncode = pcmData
+        val frameBytes = outputChannels * 2
+        if (!pcmFile.isFile || pcmFile.length() <= 0L || sampleRate <= 0 || outputChannels <= 0 ||
+            pcmFile.length() % frameBytes != 0L) return false
+        val totalFrames = pcmFile.length() / frameBytes
+        if (totalFrames <= 0L) return false
         val bitrateBps = settings.bitrateBps
-        if (pcmToEncode.isEmpty() || sampleRate <= 0 || outputChannels <= 0 ||
-            pcmToEncode.size % outputChannels != 0) return false
         val parent = outputFile.parentFile ?: return false
         if (!parent.exists() && !parent.mkdirs()) return false
 
@@ -756,109 +801,114 @@ class AudioTranscoder(private val context: Context) {
                 setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrateBps)
             }
-
             encoder = MediaCodec.createByCodecName(settings.codecName)
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoder.start()
             muxer = MediaMuxer(stagedFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
             var muxerTrack = -1
-            var pcmOffset = 0
+            var framesSubmitted = 0L
             var inputEos = false
             var outputEos = false
             var idleOutputCount = 0
-            val timeoutUs = 5000L
+            val timeoutUs = 5_000L
             val bufferInfo = MediaCodec.BufferInfo()
+            val pcmChunk = ByteArray(128 * 1024)
 
-            while (!outputEos) {
-                if (!inputEos) {
-                    val inputIndex = encoder.dequeueInputBuffer(timeoutUs)
-                    if (inputIndex >= 0) {
-                        val inputBuffer = encoder.getInputBuffer(inputIndex)
-                            ?: throw IllegalStateException("AAC encoder returned a null input buffer")
-                        inputBuffer.clear()
+            java.io.BufferedInputStream(FileInputStream(pcmFile), 64 * 1024).use { pcmInput ->
+                while (!outputEos) {
+                    if (!inputEos) {
+                        val inputIndex = encoder.dequeueInputBuffer(timeoutUs)
+                        if (inputIndex >= 0) {
+                            val inputBuffer = encoder.getInputBuffer(inputIndex)
+                                ?: throw IllegalStateException("AAC encoder returned a null input buffer")
+                            inputBuffer.clear()
 
-                        val remainingSamples = pcmToEncode.size - pcmOffset
-                        if (remainingSamples == 0) {
-                            encoder.queueInputBuffer(
-                                inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                            )
-                            inputEos = true
-                        } else {
-                            val capacitySamples = inputBuffer.capacity() / 2
-                            var samplesToWrite = minOf(remainingSamples, capacitySamples)
-                            samplesToWrite -= samplesToWrite % outputChannels
-                            if (samplesToWrite <= 0) {
+                            val remainingFrames = totalFrames - framesSubmitted
+                            if (remainingFrames == 0L) {
                                 encoder.queueInputBuffer(
                                     inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
                                 )
                                 inputEos = true
-                                return false
+                            } else {
+                                val capacityFrames = inputBuffer.capacity() / frameBytes
+                                val framesToWrite = minOf(
+                                    remainingFrames,
+                                    capacityFrames.toLong(),
+                                    (pcmChunk.size / frameBytes).toLong()
+                                ).toInt()
+                                if (framesToWrite <= 0) {
+                                    encoder.queueInputBuffer(
+                                        inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                    )
+                                    inputEos = true
+                                    return false
+                                }
+                                val bytesToWrite = framesToWrite * frameBytes
+                                var readCount = 0
+                                while (readCount < bytesToWrite) {
+                                    val read = pcmInput.read(pcmChunk, readCount, bytesToWrite - readCount)
+                                    if (read < 0) throw IllegalStateException("Truncated PCM file during AAC encoding")
+                                    if (read == 0) continue
+                                    readCount += read
+                                }
+                                inputBuffer.put(pcmChunk, 0, bytesToWrite)
+                                val presentationTimeUs = framesSubmitted * 1_000_000L / sampleRate
+                                encoder.queueInputBuffer(inputIndex, 0, bytesToWrite, presentationTimeUs, 0)
+                                framesSubmitted += framesToWrite
+                                onProgress((framesSubmitted.toFloat() / totalFrames).coerceIn(0f, 1f))
                             }
+                        }
+                    }
 
-                            inputBuffer.order(ByteOrder.LITTLE_ENDIAN)
-                                .asShortBuffer()
-                                .put(pcmToEncode, pcmOffset, samplesToWrite)
-                            val bytesToWrite = samplesToWrite * 2
-                            val framesSubmitted = pcmOffset.toLong() / outputChannels
-                            val presentationTimeUs = framesSubmitted * 1_000_000L / sampleRate
-                            encoder.queueInputBuffer(
-                                inputIndex, 0, bytesToWrite, presentationTimeUs, 0
-                            )
-                            pcmOffset += samplesToWrite
-                            onProgress((pcmOffset.toFloat() / pcmToEncode.size).coerceIn(0f, 1f))
+                    when (val outputIndex = encoder.dequeueOutputBuffer(bufferInfo, timeoutUs)) {
+                        MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            if (muxerTrack >= 0) {
+                                throw IllegalStateException("AAC encoder changed output format more than once")
+                            }
+                            val negotiatedFormat = encoder.outputFormat
+                            muxerTrack = muxer.addTrack(negotiatedFormat)
+                            muxer.start()
+                            muxerStarted = true
+                            val actualSampleRate = if (negotiatedFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                                negotiatedFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                            } else settings.sampleRate
+                            val actualChannels = if (negotiatedFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                                negotiatedFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                            } else settings.channels
+                            if (actualSampleRate != settings.sampleRate || actualChannels != settings.channels) {
+                                throw IllegalStateException("AAC encoder negotiated a different sample rate or channel count")
+                            }
+                            val actualBitrateKbps = if (negotiatedFormat.containsKey(MediaFormat.KEY_BIT_RATE)) {
+                                ((negotiatedFormat.getInteger(MediaFormat.KEY_BIT_RATE) + 500) / 1000).coerceAtLeast(1)
+                            } else settings.bitrateKbps
+                            onOutputFormat(AacOutputFormat(actualSampleRate, actualChannels, actualBitrateKbps))
                         }
-                    }
-                }
-
-                when (val outputIndex = encoder.dequeueOutputBuffer(bufferInfo, timeoutUs)) {
-                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        if (muxerTrack >= 0) {
-                            throw IllegalStateException("AAC encoder changed output format more than once")
-                        }
-                        val negotiatedFormat = encoder.outputFormat
-                        muxerTrack = muxer.addTrack(negotiatedFormat)
-                        muxer.start()
-                        muxerStarted = true
-                        val actualSampleRate = if (negotiatedFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
-                            negotiatedFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                        } else settings.sampleRate
-                        val actualChannels = if (negotiatedFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
-                            negotiatedFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        } else settings.channels
-                        if (actualSampleRate != settings.sampleRate || actualChannels != settings.channels) {
-                            throw IllegalStateException("AAC encoder negotiated a different sample rate or channel count")
-                        }
-                        val actualBitrateKbps = if (negotiatedFormat.containsKey(MediaFormat.KEY_BIT_RATE)) {
-                            ((negotiatedFormat.getInteger(MediaFormat.KEY_BIT_RATE) + 500) / 1000).coerceAtLeast(1)
-                        } else settings.bitrateKbps
-                        onOutputFormat(AacOutputFormat(actualSampleRate, actualChannels, actualBitrateKbps))
-                    }
-                    MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                        if (inputEos) {
-                            idleOutputCount++
-                            // Keep waiting up to roughly 30 seconds for slow hardware encoders to flush EOS.
-                            if (idleOutputCount > 6000) {
-                                throw IllegalStateException("AAC encoder did not signal end of stream")
+                        MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                            if (inputEos) {
+                                idleOutputCount++
+                                if (idleOutputCount > 6_000) {
+                                    throw IllegalStateException("AAC encoder did not signal end of stream")
+                                }
                             }
                         }
-                    }
-                    MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
-                    else -> if (outputIndex >= 0) {
-                        idleOutputCount = 0
-                        val outputBuffer = encoder.getOutputBuffer(outputIndex)
-                        if (outputBuffer != null && bufferInfo.size > 0 &&
-                            (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
-                            if (!muxerStarted || muxerTrack < 0) {
-                                throw IllegalStateException("AAC output arrived before the M4A muxer was ready")
+                        MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
+                        else -> if (outputIndex >= 0) {
+                            idleOutputCount = 0
+                            val outputBuffer = encoder.getOutputBuffer(outputIndex)
+                            if (outputBuffer != null && bufferInfo.size > 0 &&
+                                (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                                if (!muxerStarted || muxerTrack < 0) {
+                                    throw IllegalStateException("AAC output arrived before the M4A muxer was ready")
+                                }
+                                outputBuffer.position(bufferInfo.offset)
+                                outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                                muxer.writeSampleData(muxerTrack, outputBuffer, bufferInfo)
                             }
-                            outputBuffer.position(bufferInfo.offset)
-                            outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
-                            muxer.writeSampleData(muxerTrack, outputBuffer, bufferInfo)
-                        }
-                        encoder.releaseOutputBuffer(outputIndex, false)
-                        if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                            outputEos = true
+                            encoder.releaseOutputBuffer(outputIndex, false)
+                            if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                                outputEos = true
+                            }
                         }
                     }
                 }
@@ -871,17 +921,14 @@ class AudioTranscoder(private val context: Context) {
             muxerStarted = false
             muxer.release()
             muxer = null
-
             if (!stagedFile.isFile || stagedFile.length() <= 0L) {
                 throw IllegalStateException("M4A output is empty")
             }
-
-            // Same-directory rename keeps the finished container intact and avoids exposing a partial file.
             android.system.Os.rename(stagedFile.absolutePath, outputFile.absolutePath)
             success = outputFile.isFile && outputFile.length() > 0L
             return success
         } catch (e: Exception) {
-            e.printStackTrace()
+            android.util.Log.e("AudioTranscoder", "AAC file-stream encoding failed", e)
             return false
         } finally {
             if (muxerStarted) {

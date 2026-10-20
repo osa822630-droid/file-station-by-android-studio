@@ -16,6 +16,7 @@ object WsolaTimeStretcher {
         sampleRate: Int,
         channels: Int,
         speed: Float,
+        maxOutputSamples: Int = Int.MAX_VALUE,
         onProgress: ((Float) -> Unit)? = null
     ): ShortArray {
         if (abs(speed - 1.0f) < 0.01f || input.isEmpty()) {
@@ -35,7 +36,12 @@ object WsolaTimeStretcher {
         var maxOffset = ((sampleRate * 0.007f).toInt() * ch)
         if (maxOffset % ch != 0) maxOffset += (ch - maxOffset % ch)
 
-        val expectedOutputLength = ((input.size / clampedSpeed).toInt() + windowSize * 2)
+        val expectedOutputLengthLong = (input.size.toDouble() / clampedSpeed).toLong() + windowSize.toLong() * 2L
+        if (maxOutputSamples <= 0 || expectedOutputLengthLong > maxOutputSamples ||
+            expectedOutputLengthLong > Int.MAX_VALUE) {
+            throw PcmResourceLimitException("تغيير السرعة يحتاج ذاكرة تتجاوز الحد الآمن لهذا الجهاز.")
+        }
+        val expectedOutputLength = expectedOutputLengthLong.toInt()
         var output = ShortArray(expectedOutputLength)
         var outputPos = 0
 
@@ -99,16 +105,24 @@ object WsolaTimeStretcher {
             }
 
             // Expand output buffer if needed
-            if (outputPos + windowSize * 2 >= output.size) {
-                val newBuffer = ShortArray(output.size + expectedOutputLength / 4 + windowSize * 4)
-                System.arraycopy(output, 0, newBuffer, 0, outputPos + windowSize)
+            if (outputPos.toLong() + windowSize.toLong() * 2L >= output.size) {
+                val newSize = output.size.toLong() + expectedOutputLength / 4L + windowSize.toLong() * 4L
+                if (newSize > maxOutputSamples || newSize > Int.MAX_VALUE) {
+                    throw PcmResourceLimitException("تغيير السرعة تجاوز حد الذاكرة الآمن.")
+                }
+                val newBuffer = ShortArray(newSize.toInt())
+                System.arraycopy(output, 0, newBuffer, 0, min(output.size, outputPos + windowSize))
                 output = newBuffer
             }
         }
 
         onProgress?.invoke(1.0f)
 
-        val finalResult = ShortArray(outputPos + overlap)
+        val finalSize = outputPos.toLong() + overlap
+        if (finalSize > maxOutputSamples || finalSize > Int.MAX_VALUE) {
+            throw PcmResourceLimitException("تغيير السرعة تجاوز حد الذاكرة الآمن.")
+        }
+        val finalResult = ShortArray(finalSize.toInt())
         System.arraycopy(output, 0, finalResult, 0, finalResult.size)
         return finalResult
     }
