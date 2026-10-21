@@ -104,6 +104,7 @@ class PersistentMediaWorker(
             val item = request.item
             val existing = repository.itemsFlow.value.firstOrNull { it.id == request.mediaItemId }
             if (existing != null && File(existing.filePath).isFile && File(existing.filePath).length() > 0L) {
+                downloader.cleanupResumableDownload(request.mediaItemId)
                 succeeded++
                 completedIds += existing.id
                 continue
@@ -128,6 +129,8 @@ class PersistentMediaWorker(
                 // makes WorkManager retries idempotent without choosing a new suffix.
                 duplicateAction = DuplicateAction.REPLACE_EXISTING,
                 outputFileName = request.outputFileName,
+                resumeKey = request.mediaItemId,
+                preservePartialOnCancellation = true,
                 onDownloadProgress = { progress, downloaded, totalBytes ->
                     reporter.update(
                         progress = progress * DOWNLOAD_PROGRESS_SHARE,
@@ -160,6 +163,7 @@ class PersistentMediaWorker(
             }
             val savedItem = result.copy(id = request.mediaItemId)
             if (repository.addItem(savedItem)) {
+                downloader.cleanupResumableDownload(request.mediaItemId)
                 succeeded++
                 completedIds += savedItem.id
             } else {
@@ -168,6 +172,10 @@ class PersistentMediaWorker(
                 lastFailure = repository.storageError.value ?: "تعذر حفظ الملف في سجل المكتبة."
             }
         }
+
+        // This worker reached a terminal result. Partial sources are retained only while
+        // WorkManager may resume a cancelled/stopped execution.
+        task.requests.forEach { downloader.cleanupResumableDownload(it.mediaItemId) }
 
         val message = when {
             succeeded == 0 -> lastFailure ?: "فشل تحميل جميع العناصر المحددة."

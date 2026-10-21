@@ -2,6 +2,7 @@ package com.example.downloader
 
 import android.content.Context
 import android.media.MediaMetadataRetriever
+import android.util.AtomicFile
 import com.example.audio.AudioTranscoder
 import com.example.audio.VideoTranscoder
 import com.example.model.AudioBitrate
@@ -28,6 +29,10 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 
+private val RESUME_KEY_PATTERN = Regex("[A-Za-z0-9_-]{1,128}")
+private val CONTENT_RANGE_PATTERN = Regex("bytes\\s+(\\d+)-(\\d+)/(\\d+|\\*)", RegexOption.IGNORE_CASE)
+private val UNSATISFIED_CONTENT_RANGE_PATTERN = Regex("bytes\\s+\\*/(\\d+)", RegexOption.IGNORE_CASE)
+
 class MediaDownloader(
     private val context: Context,
     private val audioTranscoder: AudioTranscoder
@@ -42,6 +47,310 @@ class MediaDownloader(
         .build()
 
     private val userAgent = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+
+    private data class DownloadCheckpoint(
+        val completed: Boolean,
+        val totalBytes: Long,
+        val eTag: String,
+        val lastModified: String,
+        val metadata: DirectDownloadMetadata
+    )
+
+    fun resumablePartialFile(resumeKey: String): File =
+        File(File(context.filesDir, "audio_downloads"), ".resume-$resumeKey.part")
+
+    private fun resumableStateFile(resumeKey: String): File =
+        File(File(context.filesDir, "audio_downloads"), ".resume-$resumeKey.json")
+
+    fun cleanupResumableDownload(resumeKey: String) {
+        if (!RESUME_KEY_PATTERN.matches(resumeKey)) return
+        resumablePartialFile(resumeKey).delete()
+        AtomicFile(resumableStateFile(resumeKey)).delete()
+    }
+
+    private fun readCheckpoint(file: File): DownloadCheckpoint? = runCatching {
+        val json = AtomicFile(file).openRead().bufferedReader(Charsets.UTF_8).use { JSONObject(it.readText()) }
+        DownloadCheckpoint(
+            completed = json.optBoolean("completed", false),
+            totalBytes = json.optLong("totalBytes", -1L),
+            eTag = json.optString("eTag", ""),
+            lastModified = json.optString("lastModified", ""),
+            metadata = DirectDownloadMetadata(
+                fileName = json.getString("fileName"),
+                mimeType = json.getString("mimeType"),
+                extension = json.getString("extension"),
+                fileType = FileType.valueOf(json.getString("fileType"))
+            )
+        )
+    }.getOrNull()
+
+    private fun writeCheckpoint(file: File, checkpoint: DownloadCheckpoint) {
+        val atomicFile = AtomicFile(file)
+        val output = atomicFile.startWrite()
+        try {
+            val json = JSONObject().apply {
+                put("completed", checkpoint.completed)
+                put("totalBytes", checkpoint.totalBytes)
+                put("eTag", checkpoint.eTag)
+                put("lastModified", checkpoint.lastModified)
+                put("fileName", checkpoint.metadata.fileName)
+                put("mimeType", checkpoint.metadata.mimeType)
+                put("extension", checkpoint.metadata.extension)
+                put("fileType", checkpoint.metadata.fileType.name)
+            }
+            output.write(json.toString().toByteArray(Charsets.UTF_8))
+            output.fd.sync()
+            atomicFile.finishWrite(output)
+        } catch (error: Exception) {
+            atomicFile.failWrite(output)
+            throw error
+        }
+    }
+
+    private fun readFilePrefix(file: File, maximumBytes: Int): ByteArray =
+        file.inputStream().use { input ->
+            val buffer = ByteArray(maximumBytes)
+            var count = 0
+            while (count < buffer.size) {
+                val read = input.read(buffer, count, buffer.size - count)
+                if (read <= 0) break
+                count += read
+            }
+            buffer.copyOf(count)
+        }
+
+    private fun contentRangeStart(header: String?): Long? =
+        CONTENT_RANGE_PATTERN.find(header.orEmpty())?.groupValues?.getOrNull(1)?.toLongOrNull()
+
+    private fun contentRangeEnd(header: String?): Long? =
+        CONTENT_RANGE_PATTERN.find(header.orEmpty())?.groupValues?.getOrNull(2)?.toLongOrNull()
+
+    private fun contentRangeTotal(header: String?): Long? =
+        CONTENT_RANGE_PATTERN.find(header.orEmpty())?.groupValues?.getOrNull(3)?.takeIf { it != "*" }?.toLongOrNull()
+
+    private fun unsatisfiedContentRangeTotal(header: String?): Long? =
+        UNSATISFIED_CONTENT_RANGE_PATTERN.find(header.orEmpty())?.groupValues?.getOrNull(1)?.toLongOrNull()
+
+    @OptIn(InternalCoroutinesApi::class)
+    private suspend fun downloadToResumeFile(
+        url: String,
+        item: PlaylistItem,
+        targetFormat: AudioFormat,
+        outputExtension: String,
+        destination: File,
+        checkpointFile: File,
+        checkpoint: DownloadCheckpoint?,
+        onDownloadProgress: (Float, Long, Long) -> Unit
+    ): DownloadCheckpoint? = withContext(Dispatchers.IO) {
+        val job = currentCoroutineContext()[Job]
+        var offset = destination.length()
+        var prior = checkpoint
+        if (prior != null && offset > 0L && prior.totalBytes > 0L && offset == prior.totalBytes) {
+            val completed = prior.copy(completed = true)
+            writeCheckpoint(checkpointFile, completed)
+            return@withContext completed
+        }
+        if (prior != null && prior.totalBytes > 0L && offset > prior.totalBytes) {
+            destination.delete()
+            AtomicFile(checkpointFile).delete()
+            offset = 0L
+            prior = null
+        }
+        if (offset > 0L && prior == null) {
+            destination.delete()
+            AtomicFile(checkpointFile).delete()
+            return@withContext null
+        }
+        if (offset > 0L && prior != null && prior.eTag.isBlank() && prior.lastModified.isBlank()) {
+            destination.delete()
+            AtomicFile(checkpointFile).delete()
+            return@withContext null
+        }
+        if (offset <= 0L || prior == null) {
+            destination.delete()
+            AtomicFile(checkpointFile).delete()
+            offset = 0L
+            prior = null
+        }
+
+        val requestBuilder = Request.Builder()
+            .url(url)
+            .header("User-Agent", userAgent)
+            // Range offsets must refer to the same uncompressed byte representation.
+            .header("Accept-Encoding", "identity")
+            .get()
+        if (offset > 0L) {
+            requestBuilder.header("Range", "bytes=$offset-")
+            val validator = prior?.eTag?.takeIf { it.isNotBlank() }
+                ?: prior?.lastModified?.takeIf { it.isNotBlank() }
+            if (!validator.isNullOrBlank()) requestBuilder.header("If-Range", validator)
+        }
+        val call = httpClient.newCall(requestBuilder.build())
+        val cancellationHandle = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+            if (cause is CancellationException) call.cancel()
+        }
+        try {
+            call.execute().use { response ->
+                val responseETag = response.header("ETag").orEmpty()
+                val responseModified = response.header("Last-Modified").orEmpty()
+                val validatorsMatch = prior != null &&
+                    (prior.eTag.isBlank() || responseETag.isBlank() || prior.eTag == responseETag) &&
+                    (prior.lastModified.isBlank() || responseModified.isBlank() || prior.lastModified == responseModified)
+                if (response.code == 416 && offset > 0L && prior != null && validatorsMatch &&
+                    unsatisfiedContentRangeTotal(response.header("Content-Range")) == offset) {
+                    val completed = prior.copy(completed = true, totalBytes = offset)
+                    writeCheckpoint(checkpointFile, completed)
+                    return@withContext completed
+                }
+                val body = response.body ?: return@withContext null
+                if (!response.isSuccessful) return@withContext null
+                val contentRange = response.header("Content-Range")
+                val rangeStart = contentRangeStart(contentRange)
+                val rangeEnd = contentRangeEnd(contentRange)
+                val rangeTotal = contentRangeTotal(contentRange)
+                val append = offset > 0L && response.code == 206
+                if (response.code == 206 && (rangeStart == null || rangeEnd == null ||
+                        rangeStart != (if (offset > 0L) offset else 0L) || rangeEnd < rangeStart)) {
+                    return@withContext null
+                }
+                if (offset > 0L && !append) {
+                    // The server ignored Range or the If-Range validator changed. Never mix
+                    // bytes from two representations or silently restart a supposedly resumed task.
+                    destination.delete()
+                    AtomicFile(checkpointFile).delete()
+                    return@withContext null
+                }
+                if (append && rangeTotal != null && rangeEnd != null && rangeEnd >= rangeTotal) return@withContext null
+                if (append && prior?.totalBytes?.let { it > 0L && rangeTotal != null && it != rangeTotal } == true) {
+                    return@withContext null
+                }
+                if (append && prior != null) {
+                    if (prior.eTag.isNotBlank() && responseETag.isNotBlank() && prior.eTag != responseETag) {
+                        return@withContext null
+                    }
+                    if (prior.lastModified.isNotBlank() && responseModified.isNotBlank() && prior.lastModified != responseModified) {
+                        return@withContext null
+                    }
+                }
+                val totalBytes = rangeTotal
+                    ?: if (append) prior?.totalBytes ?: -1L else body.contentLength()
+                val expectedResponseBytes = if (append && rangeEnd != null) {
+                    rangeEnd - offset + 1L
+                } else {
+                    body.contentLength()
+                }
+                val responseUrl = response.request.url.toString()
+                val metadata: DirectDownloadMetadata
+                val input = body.byteStream().buffered()
+                val prefix: ByteArray
+                if (append) {
+                    prefix = readFilePrefix(destination, 1024)
+                    metadata = prior?.metadata ?: return@withContext null
+                    val revalidated = DirectDownloadMetadataResolver.validateResponse(
+                        statusCode = response.code,
+                        contentTypeHeader = response.header("Content-Type"),
+                        contentDisposition = response.header("Content-Disposition"),
+                        responseUrl = responseUrl,
+                        fallbackFileName = item.sourceFileName,
+                        prefix = prefix
+                    )
+                    if (revalidated == null || !revalidated.extension.equals(metadata.extension, ignoreCase = true)) return@withContext null
+                } else {
+                    val prefixBuffer = ByteArray(1024)
+                    var prefixSize = 0
+                    while (prefixSize < prefixBuffer.size) {
+                        job?.ensureActive()
+                        val read = input.read(prefixBuffer, prefixSize, prefixBuffer.size - prefixSize)
+                        if (read <= 0) break
+                        prefixSize += read
+                    }
+                    if (prefixSize == 0) return@withContext null
+                    prefix = prefixBuffer.copyOf(prefixSize)
+                    val inferred = DirectDownloadMetadataResolver.validateResponse(
+                        statusCode = response.code,
+                        contentTypeHeader = response.header("Content-Type"),
+                        contentDisposition = response.header("Content-Disposition"),
+                        responseUrl = responseUrl,
+                        fallbackFileName = item.sourceFileName,
+                        prefix = prefix
+                    ) ?: return@withContext null
+                    val actualSourceType = inferred.fileType.takeIf { it != FileType.OTHER } ?: item.fileType
+                    val targetMatchesSource = when {
+                        targetFormat == AudioFormat.ORIGINAL -> inferred.extension.equals(outputExtension, ignoreCase = true)
+                        targetFormat in setOf(AudioFormat.MP4, AudioFormat.MKV, AudioFormat.WEBM) -> actualSourceType == FileType.VIDEO
+                        targetFormat in setOf(AudioFormat.MP3, AudioFormat.M4A, AudioFormat.WAV) ->
+                            actualSourceType == FileType.AUDIO || actualSourceType == FileType.VIDEO
+                        else -> false
+                    }
+                    if (!targetMatchesSource) return@withContext null
+                    metadata = inferred.copy(fileType = actualSourceType)
+                }
+
+                val currentCheckpoint = (prior ?: DownloadCheckpoint(
+                    completed = false,
+                    totalBytes = totalBytes,
+                    eTag = response.header("ETag").orEmpty(),
+                    lastModified = response.header("Last-Modified").orEmpty(),
+                    metadata = metadata
+                )).copy(
+                    completed = false,
+                    totalBytes = totalBytes,
+                    eTag = response.header("ETag")?.takeIf { it.isNotBlank() } ?: prior?.eTag.orEmpty(),
+                    lastModified = response.header("Last-Modified")?.takeIf { it.isNotBlank() } ?: prior?.lastModified.orEmpty(),
+                    metadata = metadata
+                )
+                writeCheckpoint(checkpointFile, currentCheckpoint)
+                val copiedAtStart = if (append) offset else 0L
+                if (totalBytes > 0L) {
+                    onDownloadProgress((copiedAtStart / totalBytes.toFloat()).coerceIn(0f, 1f), copiedAtStart, totalBytes)
+                }
+                var segmentBytesCopied = 0L
+                FileOutputStream(destination, append).use { output ->
+                    try {
+                        if (!append) output.write(prefix)
+                        var copied = copiedAtStart + if (append) 0L else prefix.size.toLong()
+                        segmentBytesCopied = if (append) 0L else prefix.size.toLong()
+                        if (!append && totalBytes > 0L) {
+                            onDownloadProgress((copied / totalBytes.toFloat()).coerceIn(0f, 1f), copied, totalBytes)
+                        }
+                        val buffer = ByteArray(16_384)
+                        var bytesSinceSync = segmentBytesCopied
+                        while (true) {
+                            job?.ensureActive()
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            copied += read
+                            segmentBytesCopied += read
+                            bytesSinceSync += read
+                            if (bytesSinceSync >= 1_048_576L) {
+                                output.fd.sync()
+                                bytesSinceSync = 0L
+                            }
+                            if (totalBytes > 0L) {
+                                onDownloadProgress((copied / totalBytes.toFloat()).coerceIn(0f, 1f), copied, totalBytes)
+                            }
+                        }
+                    } finally {
+                        runCatching { output.fd.sync() }
+                    }
+                }
+                if (expectedResponseBytes > 0L && segmentBytesCopied != expectedResponseBytes) return@withContext null
+                val completedFileBytes = destination.length()
+                if (totalBytes > 0L && completedFileBytes != totalBytes) return@withContext null
+                val finished = currentCheckpoint.copy(completed = true)
+                writeCheckpoint(checkpointFile, finished)
+                finished
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            job?.ensureActive()
+            throw error
+        } finally {
+            cancellationHandle?.dispose()
+        }
+    }
 
     data class ExtractedMediaInfo(
         val isPlaylist: Boolean,
@@ -382,6 +691,26 @@ class MediaDownloader(
         return file
     }
 
+    private fun installDownloadedSource(source: File, destination: File, keepSource: Boolean): Boolean {
+        if (!source.isFile || source.length() <= 0L) return false
+        return try {
+            if (!keepSource) {
+                source.renameTo(destination)
+            } else {
+                source.inputStream().use { input ->
+                    FileOutputStream(destination).use { output ->
+                        input.copyTo(output, bufferSize = 64 * 1024)
+                        output.fd.sync()
+                    }
+                }
+                destination.isFile && destination.length() == source.length()
+            }
+        } catch (error: Exception) {
+            error.printStackTrace()
+            false
+        }
+    }
+
     private fun publishStagedOutput(stagedFile: File, destination: File): Boolean {
         if (!stagedFile.isFile || stagedFile.length() <= 0L) return false
         return try {
@@ -407,10 +736,13 @@ class MediaDownloader(
         targetBitrate: AudioBitrate = AudioBitrate.B128,
         duplicateAction: DuplicateAction = DuplicateAction.DOWNLOAD_ANYWAY,
         outputFileName: String? = null,
+        resumeKey: String? = null,
+        preservePartialOnCancellation: Boolean = false,
         onDownloadProgress: (progress: Float, downloaded: Long, total: Long) -> Unit,
         onSpeedProgress: (progress: Float, stage: String) -> Unit
     ): MediaItem? = withContext(Dispatchers.IO) {
         val coroutineJob = currentCoroutineContext()[Job]
+        if (resumeKey != null && !RESUME_KEY_PATTERN.matches(resumeKey)) return@withContext null
         if (duplicateAction == DuplicateAction.CANCEL) {
             return@withContext null
         }
@@ -467,7 +799,19 @@ class MediaDownloader(
             File(downloadsDir, ".${requestedOutputFile.nameWithoutExtension}.${UUID.randomUUID()}.pending.$outputExt")
         } else requestedOutputFile
 
-        val tempDownloadFile = File(downloadsDir, "temp_download_${UUID.randomUUID()}.tmp")
+        val tempDownloadFile = resumeKey?.let(::resumablePartialFile)
+            ?: File(downloadsDir, "temp_download_${UUID.randomUUID()}.tmp")
+        val checkpointFile = resumeKey?.let(::resumableStateFile)
+        var resumeCheckpoint = checkpointFile?.let(::readCheckpoint)
+        if (resumeKey != null && tempDownloadFile.isFile && tempDownloadFile.length() > 0L && resumeCheckpoint == null) {
+            cleanupResumableDownload(resumeKey)
+            return@withContext null
+        }
+        if (resumeKey != null && (resumeCheckpoint == null || !tempDownloadFile.isFile)) {
+            tempDownloadFile.delete()
+            checkpointFile?.let { AtomicFile(it).delete() }
+            resumeCheckpoint = null
+        }
 
         try {
             // 1. Resolve stream or direct download URL
@@ -482,8 +826,12 @@ class MediaDownloader(
                 }
             }
 
-            var downloadSuccessful = false
-            var downloadMetadata: DirectDownloadMetadata? = null
+            val checkpointTotalBytes = resumeCheckpoint?.totalBytes ?: -1L
+            val checkpointIsComplete = resumeCheckpoint?.completed == true && tempDownloadFile.isFile &&
+                tempDownloadFile.length() > 0L &&
+                (checkpointTotalBytes <= 0L || tempDownloadFile.length() == checkpointTotalBytes)
+            var downloadSuccessful = checkpointIsComplete
+            var downloadMetadata: DirectDownloadMetadata? = if (checkpointIsComplete) resumeCheckpoint?.metadata else null
             var originalDurationMs = item.durationSeconds * 1000L
             var finalDurationMs = originalDurationMs
             var finalResolution = ""
@@ -492,108 +840,117 @@ class MediaDownloader(
 
             // Download only a successful, non-empty response whose headers and leading bytes
             // identify a real file. This prevents HTML/JSON error pages from masquerading as media.
-            if (streamUrl.isNotEmpty() && !isYouTubeVideoUrl(streamUrl)) {
+            if (!downloadSuccessful && streamUrl.isNotEmpty() && !isYouTubeVideoUrl(streamUrl)) {
                 try {
-                    val req = Request.Builder()
-                        .url(streamUrl)
-                        .header("User-Agent", userAgent)
-                        .build()
-                    val call = httpClient.newCall(req)
-                    val cancellationHandle = coroutineJob?.invokeOnCompletion(
-                        onCancelling = true,
-                        invokeImmediately = true
-                    ) { cause ->
-                        if (cause is CancellationException) call.cancel()
-                    }
-                    try {
-                        call.execute().use { resp ->
-                        val body = resp.body
-                        if (resp.isSuccessful && body != null) {
-                            val totalBytes = body.contentLength()
-                            body.byteStream().buffered().use { input ->
-                                val prefixBuffer = ByteArray(1024)
-                                var prefixSize = 0
-                                while (prefixSize < prefixBuffer.size) {
-                                    coroutineJob?.ensureActive()
-                                    val read = input.read(prefixBuffer, prefixSize, prefixBuffer.size - prefixSize)
-                                    if (read <= 0) break
-                                    prefixSize += read
-                                }
-
-                                if (prefixSize > 0) {
-                                    val metadata = DirectDownloadMetadataResolver.validateResponse(
-                                        statusCode = resp.code,
-                                        contentTypeHeader = resp.header("Content-Type"),
-                                        contentDisposition = resp.header("Content-Disposition"),
-                                        responseUrl = resp.request.url.toString(),
-                                        fallbackFileName = item.sourceFileName,
-                                        prefix = prefixBuffer.copyOf(prefixSize)
-                                    )
-                                    val actualSourceType = metadata?.fileType
-                                        ?.takeIf { it != FileType.OTHER } ?: item.fileType
-                                    val targetMatchesSource = when {
-                                        metadata == null -> false
-                                        isOriginalFormat -> metadata.extension.equals(outputExt, ignoreCase = true)
-                                        requestsVideoContainer -> actualSourceType == FileType.VIDEO
-                                        requestsAudioContainer -> actualSourceType == FileType.AUDIO ||
-                                            actualSourceType == FileType.VIDEO
-                                        else -> false
-                                    }
-
-                                    if (metadata != null && targetMatchesSource) {
-                                        downloadMetadata = metadata.copy(fileType = actualSourceType)
-                                        FileOutputStream(tempDownloadFile).use { output ->
-                                            output.write(prefixBuffer, 0, prefixSize)
-                                            var bytesCopied = prefixSize.toLong()
-                                            if (totalBytes > 0) {
-                                                onDownloadProgress(
-                                                    (bytesCopied.toFloat() / totalBytes).coerceIn(0f, 1f),
-                                                    bytesCopied,
-                                                    totalBytes
+                    if (resumeKey != null && checkpointFile != null) {
+                        resumeCheckpoint = downloadToResumeFile(
+                            url = streamUrl,
+                            item = item,
+                            targetFormat = targetFormat,
+                            outputExtension = outputExt,
+                            destination = tempDownloadFile,
+                            checkpointFile = checkpointFile,
+                            checkpoint = resumeCheckpoint,
+                            onDownloadProgress = onDownloadProgress
+                        )
+                        downloadMetadata = resumeCheckpoint?.metadata
+                        val resumedTotalBytes = resumeCheckpoint?.totalBytes ?: -1L
+                        downloadSuccessful = resumeCheckpoint?.completed == true && tempDownloadFile.isFile &&
+                            tempDownloadFile.length() > 0L &&
+                            (resumedTotalBytes <= 0L || tempDownloadFile.length() == resumedTotalBytes)
+                    } else {
+                        val request = Request.Builder()
+                            .url(streamUrl)
+                            .header("User-Agent", userAgent)
+                            .get()
+                            .build()
+                        val call = httpClient.newCall(request)
+                        val cancellationHandle = coroutineJob?.invokeOnCompletion(
+                            onCancelling = true,
+                            invokeImmediately = true
+                        ) { cause ->
+                            if (cause is CancellationException) call.cancel()
+                        }
+                        try {
+                            call.execute().use { response ->
+                                val body = response.body
+                                if (response.isSuccessful && body != null) {
+                                    val totalBytes = body.contentLength()
+                                    body.byteStream().buffered().use { input ->
+                                        val prefixBuffer = ByteArray(1024)
+                                        var prefixSize = 0
+                                        while (prefixSize < prefixBuffer.size) {
+                                            coroutineJob?.ensureActive()
+                                            val read = input.read(prefixBuffer, prefixSize, prefixBuffer.size - prefixSize)
+                                            if (read <= 0) break
+                                            prefixSize += read
+                                        }
+                                        if (prefixSize > 0) {
+                                            val metadata = DirectDownloadMetadataResolver.validateResponse(
+                                                statusCode = response.code,
+                                                contentTypeHeader = response.header("Content-Type"),
+                                                contentDisposition = response.header("Content-Disposition"),
+                                                responseUrl = response.request.url.toString(),
+                                                fallbackFileName = item.sourceFileName,
+                                                prefix = prefixBuffer.copyOf(prefixSize)
+                                            )
+                                            val actualSourceType = metadata?.fileType
+                                                ?.takeIf { it != FileType.OTHER } ?: item.fileType
+                                            val targetMatchesSource = when {
+                                                metadata == null -> false
+                                                isOriginalFormat -> metadata.extension.equals(outputExt, ignoreCase = true)
+                                                requestsVideoContainer -> actualSourceType == FileType.VIDEO
+                                                requestsAudioContainer -> actualSourceType == FileType.AUDIO || actualSourceType == FileType.VIDEO
+                                                else -> false
+                                            }
+                                            if (metadata != null && targetMatchesSource) {
+                                                downloadMetadata = metadata.copy(fileType = actualSourceType)
+                                                FileOutputStream(tempDownloadFile).use { output ->
+                                                    output.write(prefixBuffer, 0, prefixSize)
+                                                    var bytesCopied = prefixSize.toLong()
+                                                    if (totalBytes > 0L) onDownloadProgress(
+                                                        (bytesCopied.toFloat() / totalBytes).coerceIn(0f, 1f), bytesCopied, totalBytes
+                                                    )
+                                                    val buffer = ByteArray(16_384)
+                                                    while (true) {
+                                                        coroutineJob?.ensureActive()
+                                                        val read = input.read(buffer)
+                                                        if (read < 0) break
+                                                        output.write(buffer, 0, read)
+                                                        bytesCopied += read
+                                                        if (totalBytes > 0L) onDownloadProgress(
+                                                            (bytesCopied.toFloat() / totalBytes).coerceIn(0f, 1f), bytesCopied, totalBytes
+                                                        )
+                                                    }
+                                                    output.fd.sync()
+                                                }
+                                                downloadSuccessful = tempDownloadFile.isFile && tempDownloadFile.length() > 0L
+                                            } else {
+                                                onSpeedProgress(
+                                                    0.02f,
+                                                    if (metadata == null) "رُفضت استجابة HTML/JSON أو ملف غير صالح."
+                                                    else "نوع الملف أو امتداده لا يطابق الخيار المحدد."
                                                 )
                                             }
-                                            val buffer = ByteArray(16_384)
-                                            var read: Int
-                                            while (input.read(buffer).also { read = it } != -1) {
-                                                coroutineJob?.ensureActive()
-                                                output.write(buffer, 0, read)
-                                                bytesCopied += read
-                                                if (totalBytes > 0) {
-                                                    onDownloadProgress(
-                                                        (bytesCopied.toFloat() / totalBytes).coerceIn(0f, 1f),
-                                                        bytesCopied,
-                                                        totalBytes
-                                                    )
-                                                }
-                                            }
                                         }
-                                    } else {
-                                        onSpeedProgress(
-                                            0.02f,
-                                            if (metadata == null) "رُفضت استجابة HTML/JSON أو ملف غير صالح."
-                                            else "نوع الملف أو امتداده لا يطابق الخيار المحدد."
-                                        )
                                     }
                                 }
                             }
-                            downloadSuccessful = downloadMetadata != null &&
-                                tempDownloadFile.isFile && tempDownloadFile.length() > 0L
+                        } finally {
+                            cancellationHandle?.dispose()
                         }
-                        }
-                    } finally {
-                        cancellationHandle?.dispose()
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
-                } catch (e: Exception) {
+                } catch (error: Exception) {
                     coroutineJob?.ensureActive()
-                    e.printStackTrace()
+                    error.printStackTrace()
                 }
             }
 
             // Never substitute generated content for a failed download.
             if (!downloadSuccessful) {
-                tempDownloadFile.delete()
+                if (resumeKey == null) tempDownloadFile.delete()
                 if (targetOutputFile != requestedOutputFile) targetOutputFile.delete()
                 return@withContext null
             }
@@ -630,7 +987,7 @@ class MediaDownloader(
                 val videoInfo = videoTranscoder.inspectVideo(tempDownloadFile)
                 if (videoInfo == null) {
                     onSpeedProgress(0.1f, "تعذر التحقق من مسار الفيديو؛ أُلغي إخراج الملف.")
-                    tempDownloadFile.delete()
+                    if (resumeKey == null) tempDownloadFile.delete()
                     return@withContext null
                 }
                 finalResolution = "${minOf(videoInfo.width, videoInfo.height)}p (${videoInfo.width} x ${videoInfo.height})"
@@ -642,9 +999,9 @@ class MediaDownloader(
             // 2. Re-encode video through Android's decoder/encoder for the requested size and speed.
             var audioOutputInfo: AudioTranscoder.AudioOutputInfo? = null
             if (isOriginalFormat) {
-                val moved = tempDownloadFile.renameTo(targetOutputFile)
+                val moved = installDownloadedSource(tempDownloadFile, targetOutputFile, keepSource = resumeKey != null)
                 if (!moved || !targetOutputFile.isFile || targetOutputFile.length() <= 0L) {
-                    tempDownloadFile.delete()
+                    if (resumeKey == null) tempDownloadFile.delete()
                     targetOutputFile.delete()
                     return@withContext null
                 }
@@ -656,7 +1013,7 @@ class MediaDownloader(
                         kotlin.math.abs(targetSpeed - 1.0f) > 0.01f ||
                         minOf(sourceInfo.width, sourceInfo.height) > targetQuality.height) {
                         onSpeedProgress(0.1f, "إعادة الترميز إلى WebM غير مدعومة؛ يتطلب WebM الحالي نسخ مسار المصدر دون تغيير الدقة أو السرعة.")
-                        tempDownloadFile.delete()
+                        if (resumeKey == null) tempDownloadFile.delete()
                         return@withContext null
                     }
                     onSpeedProgress(0.1f, "إعادة تعبئة مسار المصدر في حاوية WebM دون تغيير الدقة أو السرعة (حد الدقة ${requestedShortSide}px)...")
@@ -665,7 +1022,7 @@ class MediaDownloader(
                         outputFile = targetOutputFile,
                         onProgress = onSpeedProgress
                     )
-                    tempDownloadFile.delete()
+                    if (resumeKey == null) tempDownloadFile.delete()
                     if (!remuxSuccess || !targetOutputFile.isFile || targetOutputFile.length() <= 0L) {
                         targetOutputFile.delete()
                         return@withContext null
@@ -684,7 +1041,7 @@ class MediaDownloader(
                         targetSpeed = targetSpeed,
                         onProgress = onSpeedProgress
                     )
-                    tempDownloadFile.delete()
+                    if (resumeKey == null) tempDownloadFile.delete()
                     if (finalVideoInfo == null || !targetOutputFile.isFile || targetOutputFile.length() <= 0L) {
                         targetOutputFile.delete()
                         return@withContext null
@@ -705,7 +1062,7 @@ class MediaDownloader(
                     onProgress = onSpeedProgress,
                     onOutputInfo = { audioOutputInfo = it }
                 )
-                tempDownloadFile.delete()
+                if (resumeKey == null) tempDownloadFile.delete()
 
                 if (!transcodeSuccess || !targetOutputFile.isFile || targetOutputFile.length() <= 0L) {
                     targetOutputFile.delete()
@@ -713,9 +1070,9 @@ class MediaDownloader(
                 }
             } else {
                 // A failed move must not be reported as a successful library item.
-                val moved = tempDownloadFile.renameTo(targetOutputFile)
+                val moved = installDownloadedSource(tempDownloadFile, targetOutputFile, keepSource = resumeKey != null)
                 if (!moved || !targetOutputFile.isFile || targetOutputFile.length() <= 0L) {
-                    tempDownloadFile.delete()
+                    if (resumeKey == null) tempDownloadFile.delete()
                     targetOutputFile.delete()
                     return@withContext null
                 }
@@ -760,12 +1117,17 @@ class MediaDownloader(
                 sourceUrl = item.url
             )
         } catch (cancelled: CancellationException) {
-            if (tempDownloadFile.exists()) tempDownloadFile.delete()
+            if (resumeKey == null || !preservePartialOnCancellation) {
+                tempDownloadFile.delete()
+                checkpointFile?.let { AtomicFile(it).delete() }
+            } else if (tempDownloadFile.isFile) {
+                runCatching { FileOutputStream(tempDownloadFile, true).use { it.fd.sync() } }
+            }
             targetOutputFile.delete()
             throw cancelled
         } catch (e: Exception) {
             e.printStackTrace()
-            if (tempDownloadFile.exists()) tempDownloadFile.delete()
+            if (resumeKey == null) tempDownloadFile.delete()
             targetOutputFile.delete()
             return@withContext null
         }

@@ -6,6 +6,9 @@ import com.example.downloader.MediaDownloader
 import com.example.model.AudioFormat
 import com.example.model.FileType
 import com.example.model.PlaylistItem
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -21,6 +24,9 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import okio.Buffer
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -223,6 +229,87 @@ class MediaDownloaderFailureTest {
         assertEquals(FileType.DOCUMENT, downloaded.fileType)
         assertEquals("PDF", downloaded.format)
         assertEquals(3, server.requestCount)
+    }
+
+    @Test
+    fun `persistent download resumes exact byte offset with matching validator`() = runBlocking {
+        val id = UUID.randomUUID().toString()
+        val resumeKey = "resume_$id"
+        val totalBytes = 512 * 1024
+        val pdfBytes = ByteArray(totalBytes) { (it % 239).toByte() }.also {
+            "%PDF-1.7\n".toByteArray(Charsets.US_ASCII).copyInto(it)
+        }
+        val etag = "\"stable-version\""
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/pdf")
+                .setHeader("Content-Disposition", "attachment; filename=guide-$id.pdf")
+                .setHeader("ETag", etag)
+                .setBody(Buffer().write(pdfBytes))
+                .throttleBody(16L * 1024L, 100L, TimeUnit.MILLISECONDS)
+        )
+
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val downloader = MediaDownloader(context, AudioTranscoder(context))
+        val item = PlaylistItem(
+            id = id,
+            title = "resume-test-$id",
+            url = server.url("/guide.pdf").toString(),
+            fileType = FileType.DOCUMENT,
+            isVideo = false,
+            sourceMimeType = "application/pdf",
+            sourceFileName = "guide-$id.pdf"
+        )
+        val reachedOffset = CountDownLatch(1)
+        val firstAttempt = async(Dispatchers.IO) {
+            downloader.downloadAndProcessItem(
+                item = item,
+                targetFormat = AudioFormat.ORIGINAL,
+                targetSpeed = 1.0f,
+                resumeKey = resumeKey,
+                preservePartialOnCancellation = true,
+                onDownloadProgress = { _, downloaded, _ -> if (downloaded >= 32 * 1024L) reachedOffset.countDown() },
+                onSpeedProgress = { _, _ -> }
+            )
+        }
+
+        assertTrue("The first response should write a resumable prefix", reachedOffset.await(10, TimeUnit.SECONDS))
+        firstAttempt.cancelAndJoin()
+        val initialRequest = server.takeRequest(1, TimeUnit.SECONDS)
+        assertEquals("A fresh download starts at byte zero", null, initialRequest?.getHeader("Range"))
+        val partial = downloader.resumablePartialFile(resumeKey)
+        val savedOffset = partial.length()
+        assertTrue("Cancellation should retain a strict, non-empty partial file", savedOffset > 0L && savedOffset < totalBytes.toLong())
+
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(206)
+                .setHeader("Content-Type", "application/pdf")
+                .setHeader("Content-Disposition", "attachment; filename=guide-$id.pdf")
+                .setHeader("ETag", etag)
+                .setHeader("Content-Range", "bytes $savedOffset-${totalBytes - 1}/$totalBytes")
+                .setBody(Buffer().write(pdfBytes, savedOffset.toInt(), totalBytes - savedOffset.toInt()))
+        )
+        val resumed = downloader.downloadAndProcessItem(
+            item = item,
+            targetFormat = AudioFormat.ORIGINAL,
+            targetSpeed = 1.0f,
+            resumeKey = resumeKey,
+            preservePartialOnCancellation = true,
+            onDownloadProgress = { _, _, _ -> },
+            onSpeedProgress = { _, _ -> }
+        )
+
+        val saved = resumed ?: throw AssertionError("The Range response should complete the interrupted download")
+        val resumedRequest = server.takeRequest(1, TimeUnit.SECONDS)
+        assertEquals("bytes=$savedOffset-", resumedRequest?.getHeader("Range"))
+        assertEquals(etag, resumedRequest?.getHeader("If-Range"))
+        assertTrue(File(saved.filePath).readBytes().contentEquals(pdfBytes))
+        assertEquals(2, server.requestCount)
+        downloader.cleanupResumableDownload(resumeKey)
+        File(saved.filePath).delete()
+        Unit
     }
 
     @Test

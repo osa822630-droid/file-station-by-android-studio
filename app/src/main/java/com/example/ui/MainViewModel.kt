@@ -396,7 +396,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 _backgroundWorkPaused.value = actuallyPaused
                 _actionMessage.value = if (actuallyPaused) {
-                    "أُوقفت المهمة مؤقتًا. العناصر المكتملة محفوظة؛ قد يُعاد العنصر الجاري من بدايته عند الاستئناف."
+                    "أُوقفت المهمة مؤقتًا. العناصر المكتملة محفوظة؛ يستأنف تنزيل الملف من إزاحته المحفوظة إذا دعم الخادم HTTP Range ومُعرّف المورد، وإلا يُبلّغ عن التعذر بدل خلط البيانات."
                 } else {
                     "اكتملت المهمة قبل تنفيذ الإيقاف المؤقت."
                 }
@@ -455,7 +455,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 withContext(Dispatchers.IO) { operation.result.get() }
                 _backgroundWorkPaused.value = false
                 _actionMessage.value = if (task is StoredMediaTask.DownloadBatch) {
-                    "استؤنف التحميل؛ ستُحفظ العناصر المكتملة، وقد يُعاد تنزيل العنصر الجاري من بدايته."
+                    "استؤنف التحميل؛ العناصر المكتملة محفوظة، ويُطلب استكمال الملف من إزاحته المحفوظة مع التحقق من مُعرّف المورد ودعم HTTP Range."
                 } else {
                     "استؤنف التحويل. سيُعاد التحويل الجاري من بدايته، مع بقاء الملف المصدر محفوظًا."
                 }
@@ -494,6 +494,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val path = info.taggedValue(PersistentMediaWorker.TAG_TASK_FILE_PREFIX) ?: return@forEach
                 val taskFile = File(path)
                 val task = runCatching { BackgroundMediaTaskStore.read(taskFile) }.getOrNull()
+                if (task is StoredMediaTask.DownloadBatch) {
+                    task.requests.forEach { downloader.cleanupResumableDownload(it.mediaItemId) }
+                }
                 val hasSavedLocalOutput = task is StoredMediaTask.LocalConversion &&
                     repository.itemsFlow.value.any { it.id == task.id && File(it.filePath).isFile }
                 BackgroundMediaTaskStore.delete(
