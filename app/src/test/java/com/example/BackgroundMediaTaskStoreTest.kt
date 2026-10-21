@@ -17,6 +17,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import kotlinx.coroutines.runBlocking
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.util.UUID
 
@@ -92,6 +94,51 @@ class BackgroundMediaTaskStoreTest {
         BackgroundMediaTaskStore.clearPaused(descriptor)
         assertFalse(BackgroundMediaTaskStore.isPaused(descriptor))
         BackgroundMediaTaskStore.delete(descriptor, restored)
+    }
+
+    @Test
+    fun localSourceCopyResumesFromTheExactPersistedOffset() = runBlocking {
+        val id = UUID.randomUUID().toString()
+        val payload = ByteArray(384 * 1024) { (it % 251).toByte() }
+        val savedOffset = 117_321
+        val partial = File(context.filesDir, "source-resume-$id.partial")
+        partial.writeBytes(payload.copyOfRange(0, savedOffset))
+        val reportedOffsets = mutableListOf<Long>()
+
+        try {
+            BackgroundMediaTaskStore.resumeSourceCopyFromInputStream(
+                source = ByteArrayInputStream(payload),
+                partial = partial,
+                totalBytes = payload.size.toLong()
+            ) { copied, _ -> reportedOffsets += copied }
+
+            assertEquals("Progress must begin at the durable offset, not zero", savedOffset.toLong(), reportedOffsets.first())
+            assertEquals(payload.size.toLong(), reportedOffsets.last())
+            assertTrue("The resumed file must match the original byte-for-byte", partial.readBytes().contentEquals(payload))
+        } finally {
+            partial.delete()
+        }
+    }
+
+    @Test
+    fun localSourceCopyRejectsAChangedPrefixInsteadOfCombiningDifferentSources() = runBlocking {
+        val partial = File(context.filesDir, "source-resume-mismatch-${UUID.randomUUID()}.partial")
+        val oldPrefix = "original prefix".toByteArray()
+        partial.writeBytes(oldPrefix)
+        try {
+            val error = runCatching {
+                BackgroundMediaTaskStore.resumeSourceCopyFromInputStream(
+                    source = ByteArrayInputStream("changed prefix and suffix".toByteArray()),
+                    partial = partial,
+                    totalBytes = 25L
+                )
+            }.exceptionOrNull()
+
+            assertTrue("A changed prefix must fail safely", error is IllegalStateException)
+            assertTrue("The saved prefix must remain untouched after a failed validation", partial.readBytes().contentEquals(oldPrefix))
+        } finally {
+            partial.delete()
+        }
     }
 
     @Test
